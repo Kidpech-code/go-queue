@@ -291,6 +291,9 @@ DLQ → มนุษย์ดู last_error → แก้บั๊ก/แก้�
 `⚠️` = คืน error ไม่ใช่ panic ไม่ใช่เงียบ — **การเรียกผิดสถานะต้องส่งเสียง**
 เพราะ `ErrNotInflight` คือสัญญาณว่า visibility timeout สั้นเกินไป ([§6.4](#64-งานที่ยาวกว่า-visibility-timeout-จะถูกทำซ้ำตลอดกาล))
 
+เหตุการณ์เดียวที่ไม่อยู่ในตาราง: `TakeDead` แตะเฉพาะงานใน **DLQ** (ดึงออกจากระบบ
+เพื่อ replay) — สถานะอื่นไม่กระทบทั้งสิ้น ยืนยันโดย `TestTakeDeadOnlyTouchesDLQ`
+
 ### 2.4 Invariant ที่ต้องเป็นจริงตลอดเวลา
 
 | # | Invariant | บังคับใช้อย่างไร | พังแล้วเกิดอะไร |
@@ -298,7 +301,7 @@ DLQ → มนุษย์ดู last_error → แก้บั๊ก/แก้�
 | **I1** | งาน 1 ชิ้นอยู่ได้ที่เดียว: `ready ⊎ delayed ⊎ leases ⊎ dead` | ทุกการย้ายทำใต้ `q.mu` เดียวกัน และ `Pop` แล้วค่อย `Push` เสมอ | `Job.index` ชี้ผิด heap → `heap.Remove` **ลบงานอื่นทิ้งเงียบ ๆ** |
 | **I2** | `id ∈ inflight` ⟺ `job ∈ leases` | `Ack`/`Nack`/`promoteLocked` แก้ทั้งสองที่ในบล็อกเดียว | งานค้าง inflight ตลอดกาล (memory leak) หรือ lease หมดแล้วไม่มีใครกู้ |
 | **I2b** | `Job.ID` ไม่ซ้ำกันในหมู่งานที่ยังไม่จบ | `ids map[string]struct{}` + `ErrDuplicateID` ใน `Enqueue` | **พบบั๊กจริงตอนรีวิว:** ID ซ้ำทำให้ `inflight[id]` ถูกเขียนทับ → `Stats` รายงาน `Inflight=1` ทั้งที่ dequeue ไป 2, `capacity` นับต่ำกว่าจริง, และงานที่ ack ไปแล้วกลับมาถูกทำซ้ำหลัง lease หมด |
-| **I2c** | ทุก method ที่แตะสถานะต้องเรียก `promoteLocked()` ก่อน | บรรทัดแรกของ `Dequeue`/`Ack`/`Nack`/`Extend`/`Stats`/`Dead` | **พบตอนรีวิว:** ถ้าไม่ promote `Ack` ที่มาช้า 10 นาทีจะยังสำเร็จ ตราบใดที่ไม่มีใครเรียก `Dequeue` คั่น ⇒ พฤติกรรมขึ้นกับ traffic ที่ไม่เกี่ยวข้อง = ทดสอบไม่ได้ |
+| **I2c** | ทุก method ที่แตะสถานะต้องเรียก `promoteLocked()` ก่อน | บรรทัดแรกของ `Dequeue`/`Ack`/`Nack`/`Extend`/`Stats`/`Dead`/`TakeDead` | **พบตอนรีวิว:** ถ้าไม่ promote `Ack` ที่มาช้า 10 นาทีจะยังสำเร็จ ตราบใดที่ไม่มีใครเรียก `Dequeue` คั่น ⇒ พฤติกรรมขึ้นกับ traffic ที่ไม่เกี่ยวข้อง = ทดสอบไม่ได้ |
 | **I3** | `Attempt` เพิ่มที่ **`Dequeue`** เท่านั้น | บรรทัดเดียวใน `Dequeue` | งานที่ทำให้ worker crash จะวนตลอดกาลโดย `Attempt` ไม่ขึ้น → ไม่มีวันถึง DLQ |
 | **I4** | `enqueued` ไม่ถูกรีเซ็ตตอน retry | `if j.enqueued.IsZero()` ใน `Enqueue` | `OldestReady` วัดแค่ตั้งแต่ retry รอบล่าสุด → **มองไม่เห็นงานที่ค้างมา 3 ชั่วโมง** |
 | **I5** | ไม่ถือ mutex ขณะเรียก handler | `Dequeue` `Unlock` ก่อน `return` | คิวทั้งใบหยุดตามเวลาที่ handler ใช้ = concurrency กลายเป็น 1 |
@@ -532,14 +535,15 @@ ch := make(chan Job, 4)        runtime.hchan
 | `Ack(id) error` | ยืนยันสำเร็จ | `ErrNotInflight` = lease หมดไปแล้ว → นับใน `Stats.AckTooLate` ให้อัตโนมัติ |
 | **`Extend(id, d) error`** | ต่ออายุ lease | เทียบเท่า `ChangeMessageVisibility`; ล้มเหลว = **หยุดทำงานทันที** |
 | `Nack(id, delay, cause) error` | แจ้งล้มเหลว | `delay` จาก `Backoff(j.Attempt)`; `cause` → `Job.LastErr` ให้ DLQ วินิจฉัยได้ |
-| `Close()` | หยุดรับงานใหม่ | งานใน `delayed` **ถูกทิ้ง** |
+| `Close()` | หยุดรับงานใหม่ | `ready` ที่ค้าง drain ต่อได้จนหมด; `delayed` ที่**ยังไม่ถึงเวลา**ถูกทิ้ง (`Dequeue` ไม่รอ) |
 | `Stats() Stats` | อ่านสถานะ | `O(n)`; **มี side effect โดยตั้งใจ** — promote ก่อนนับ |
-| `Dead() []*Job` | สำเนา**ลึก**ของ DLQ | **มี side effect โดยตั้งใจ** — promote ก่อนอ่าน ([I2c](#24-invariant-ที่ต้องเป็นจริงตลอดเวลา)); ตัวที่ได้ส่งกลับเข้า `Enqueue` ได้เลย |
+| `Dead() []*Job` | สำเนา**ลึก**ของ DLQ ไว้*ดู* | **มี side effect โดยตั้งใจ** — promote ก่อนอ่าน ([I2c](#24-invariant-ที่ต้องเป็นจริงตลอดเวลา)); จะ replay ให้ใช้ `TakeDead` ไม่งั้นตัวเดิมค้างใน DLQ |
+| `TakeDead(n) []*Job` | **ดึงออก**จาก DLQ สูงสุด `n` ตัว (เก่าสุดก่อน) | โอนความเป็นเจ้าของ — ส่งกลับเข้า `Enqueue` ได้เลยโดย `Stats().Dead` ไม่นับซ้ำ และ DLQ ได้ที่ว่างคืน; `n ≤ 0` = ไม่หยิบ; promote ก่อนเช่นเดียวกับ `Dead` |
 | `RunPool(ctx, q, workers, timeout, h)` | บล็อกจน worker ออกครบ | เรียกใน goroutine ถ้าต้องการ drain แบบมี deadline |
 | `Backoff(attempt) time.Duration` | exponential + full jitter | คืนค่าได้ใกล้ 0 — เป็นเรื่องปกติของ full jitter |
 
 **กฎเดียวที่ทำให้ semantics คาดเดาได้: ทุก method ที่แตะสถานะจะ `promoteLocked()` ก่อนเสมอ**
-(`Dequeue`, `Ack`, `Nack`, `Extend`, `Stats`, `Dead`) — ไม่งั้นการตัดสินว่า "lease หมดหรือยัง"
+(`Dequeue`, `Ack`, `Nack`, `Extend`, `Stats`, `Dead`, `TakeDead`) — ไม่งั้นการตัดสินว่า "lease หมดหรือยัง"
 จะขึ้นกับว่า *มี goroutine อื่นบังเอิญเรียก `Dequeue` คั่นหรือไม่* ซึ่งไม่ deterministic
 ราคาคือ peek สอง heap = `O(1)` เมื่อไม่มีอะไรหมดอายุ
 
@@ -1473,7 +1477,7 @@ Priority ไม่ช่วย เพราะทุกงานของ tenant
 | DLQ พุ่ง | **หยุด producer ก่อน** แล้วดู `q.Dead()[0].LastErr` — มักเป็นสาเหตุเดียวกันทั้งกอง (DLQ เก็บ N ตัว*แรก* จึงเป็นตัวที่เกิดตอนปัญหาเริ่ม ไม่ใช่ตอนท่วมแล้ว) |
 | งานทำซ้ำผิดปกติ | เช็ก `ack_too_late_total` → ขยาย VT ทันที ([§6.4](#64-งานที่ยาวกว่า-visibility-timeout-จะถูกทำซ้ำตลอดกาล)) |
 | deploy แล้ว unmarshal พัง | rollback; งานที่ค้างจะกลับมาเองหลัง lease หมด ([§5.4](#54-สิ่งที่ต้องทำ-ไม่งั้นเจ็บ) ข้อ 5) |
-| ต้อง replay DLQ | `UPDATE jobs SET state='ready', attempt=0, run_at=now() WHERE state='dead' AND id = ANY($1)` — **ทีละชุด อย่ายิงหมดทีเดียว** |
+| ต้อง replay DLQ | ใน `MemQueue`: `for _, j := range q.TakeDead(100) { q.Enqueue(j) }`; ใน Postgres: `UPDATE jobs SET state='ready', attempt=0, run_at=now() WHERE state='dead' AND id = ANY($1)` — ทั้งคู่ **ทีละชุด อย่ายิงหมดทีเดียว** |
 
 ---
 
@@ -1487,7 +1491,7 @@ Priority ไม่ช่วย เพราะทุกงานของ tenant
 | 2 | **in-memory ล้วน** | deploy = งานที่ค้างหายหมด รวมถึงงานใน `delayed` และ DLQ | งานห้ามหาย → [§5](#5-production-postgres--skip-locked) |
 | 3 | `Stats()` สแกน `O(n)` | เรียกใน hot loop ที่ n = 100k → หยุดคิวทุกครั้งที่เรียก | เรียกทุก 10 วิเท่านั้น; ถ้าจำเป็นเพิ่ม heap ที่ 4 เรียงตาม `enqueued` |
 | 4 | `Close()` ทิ้งงานใน `delayed` | งาน retry ที่รออยู่หายตอน shutdown | ยอมรับได้ — in-memory หายอยู่แล้ว. ถ้าไม่ยอมรับ = ต้องการ durability = ข้อ 2 |
-| 5 | DLQ เก็บได้แค่ `capacity` ตัว | เกินนั้นงานที่ล้มจะไม่ถูกเก็บหลักฐาน (นับใน `Stats.DeadDropped`) | ต่อ DLQ ออกที่เก็บจริง (ตาราง/S3) + alert. **เดิมข้อนี้คือ "โตไม่จำกัด" ซึ่งเป็น memory leak — แก้แล้ว** |
+| 5 | DLQ เก็บได้แค่ `capacity` ตัว | เกินนั้นงานที่ล้มจะไม่ถูกเก็บหลักฐาน (นับใน `Stats.DeadDropped`) | ระบายด้วย `TakeDead` เป็นระยะ — replay หรือส่งต่อที่เก็บจริง (ตาราง/S3) + alert เมื่อ `DeadDropped` ขยับ. **ประวัติ: เดิม "โตไม่จำกัด" (memory leak) → มีขอบ → ขอบที่ระบายได้** |
 | 6 | **broadcast ปลุก waiter ทุกตัวเพื่องาน 1 ชิ้น** | **วัดได้:** throughput ตก ~10 เท่าจาก 8 → 512 worker. (allocation แก้ไปแล้วด้วยการใช้ timer ซ้ำ: 31 → 5 allocs/op) | worker > ~64 → waiter queue แบบ FIFO (ให้แต่ละ waiter มี channel ของตัวเอง แล้วปลุกทีละตัว) |
 | 7 | ไม่มี per-key ordering / fairness | tenant เดียวกลบทุกคน; งานของ user เดียวกันสลับลำดับ | ต้องการ [§6.5](#65-head-of-line-blocking)–[§6.7](#67-multi-tenant-1-tenant-ยิงล้านงานกลบทุกคน) → แยกคิว |
 | 8 | `Job.Payload` เป็น `[]byte` ไม่มี schema | deploy แล้วอ่านของเก่าไม่ออก | ใส่ version ใน payload ตั้งแต่วันแรก ([§5.4](#54-สิ่งที่ต้องทำ-ไม่งั้นเจ็บ) ข้อ 5) |
@@ -1833,11 +1837,13 @@ benchmark นี้ถูก**เพิ่มเข้า repo** ไม่ใช
 งานที่หายไปทั้งที่ทุกโครงสร้าง "ถูกต้องในตัวมันเอง"
 
 ```
-enqueued == acked + dead + deadDropped + (ready + delayed + inflight)
+enqueued == acked + taken + dead + deadDropped + (ready + delayed + inflight)
 ```
 
+(`taken` = ออกจากระบบทาง `TakeDead` — replay กลับเข้ามานับเป็น `enqueued` รอบใหม่)
+
 **ชั้นที่ 3 — `TestModelRandomOps`**: สุ่ม 20 seed × 400 operation
-(`Enqueue`/`Dequeue`/`Ack`/`Nack`/`Extend`/เวลาเดิน/`Dead`) แล้วตรวจสองชั้นบน
+(`Enqueue`/`Dequeue`/`Ack`/`Nack`/`Extend`/เวลาเดิน/`Dead`/`TakeDead`+replay) แล้วตรวจสองชั้นบน
 **หลังทุก operation**. seed คงที่ ⇒ เทสแดงแล้ว reproduce ได้ทันที ไม่ใช่ "ลองรันใหม่ดู"
 รันในนาฬิกาปลอม ⇒ 8,000 operation จบใน ~0 วินาที
 
@@ -1882,7 +1888,7 @@ input ที่ทำให้พังจะถูกเขียนลง `tes
 | backoff | อยู่ในช่วง **และโตจริง และอิ่มตัว และกระจาย** | `TestBackoffBounds`, `TestBackoffGrowsAndSaturates` |
 | ความเป็นเจ้าของ | `Dequeue`/`Dead()` คืนสำเนา ไม่ใช่ตัวจริง | `TestDequeueReturnsIsolatedCopy`, `TestDeadJobsReplayCleanly` |
 | shutdown | `ctx` ที่ยกเลิกแล้วต้องไม่กินโควตา retry | `TestCancelledCtxTakesNoJob` |
-| ทรัพยากร | goroutine/timer ไม่รั่ว, heap ไม่ถือ pointer ค้าง | `TestNoGoroutineLeak`, `TestPoppedJobNotRetained` |
+| ทรัพยากร | goroutine/timer ไม่รั่ว, heap/DLQ ไม่ถือ pointer ค้าง | `TestNoGoroutineLeak`, `TestPoppedJobNotRetained`, `TestTakenDeadJobNotRetained` |
 | ครบวงจร | pool + panic + retry-แล้วผ่าน + graceful shutdown | `TestPoolEndToEnd`, `TestRunPoolAcksAndNacks` |
 | timeout ต่องาน | handler ได้ `ctx` ที่มี deadline และถูกตัดตรงเวลา | `TestHandlerDeadlineEnforced` |
 | lease | `Extend` ทั้งต่อและ**ย่น**; ย่นแล้วต้องปลุก waiter | `TestExtendReordersLeaseHeap`, `TestExtendShorteningWakesWaiter` |
@@ -1890,6 +1896,8 @@ input ที่ทำให้พังจะถูกเขียนลง `tes
 | tie-break | เรียงตาม `seq` ไม่ใช่อายุและไม่ใช่ `Attempt` (replay DLQ ต้องต่อท้าย) | `TestFIFOTieBreakIsSeqNotAgeOrAttempt` |
 | สัญญาของ heap | `Pop`/`Remove` ต้องตั้ง `index = -1` | `TestHeapPopClearsIndex` |
 | DLQ | `Dead()` ต้องตอบตรงกับ `Stats().Dead` เสมอ | `TestDeadPromotesBeforeReporting` |
+| ระบาย DLQ | `TakeDead`: เก่าสุดก่อน, ขอบ `n` ทุกด้าน, promote ก่อน, replay ไม่นับซ้ำ + คืนที่ว่าง, แตะเฉพาะ DLQ | `TestTakeDeadDrainsOldestFirst`, `TestTakeDeadBounds`, `TestTakeDeadPromotesBeforeTaking`, `TestTakeDeadReplayRoundTrip`, `TestTakeDeadOnlyTouchesDLQ` |
+| ปิดคิว | drain `ready` + `delayed` ที่ถึงเวลาแล้ว; ไม่รอตัวที่ยังไม่ถึง | `TestClosedQueueSemantics` |
 
 **invariant เดียวที่เทสอัตโนมัติไม่ได้คือ [I5](#24-invariant-ที่ต้องเป็นจริงตลอดเวลา)** ("ไม่ถือ mutex ขณะเรียก handler") —
 เป็นคุณสมบัติเชิงโครงสร้างของโค้ด ไม่ใช่ของ state. บังคับด้วยการรีวิว:

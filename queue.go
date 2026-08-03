@@ -18,10 +18,15 @@ import (
 
 // ─────────────────────────── 1. โดเมน ───────────────────────────
 
-// Job คือหน่วยงานหนึ่งชิ้น. ห้ามแก้ฟิลด์หลังส่งเข้า Enqueue แล้ว — คิวเป็นเจ้าของ
+// Job คือหน่วยงานหนึ่งชิ้น. ห้ามแตะ (ทั้งอ่านและเขียน) หลังส่งเข้า Enqueue แล้ว —
+// คิวเป็นเจ้าของและเขียนต่อใต้ล็อกของตัวเอง (Attempt ตอน Dequeue, RunAt ตอน retry)
+// จงใจโอนความเป็นเจ้าของแทนการ copy ที่ Enqueue: ประหยัดหนึ่ง alloc บน hot path
+// แลกกับกฎที่ compiler ไม่ช่วยบังคับ
 //
 // Dequeue คืน **สำเนา** เสมอ ผู้เรียกจึงอ่านทุกฟิลด์ได้อย่างปลอดภัยแม้ lease หมดไปแล้ว
 // (คิวยังเขียนตัวจริงต่อ เช่น Attempt++ ตอนส่งซ้ำ — ถ้าคืน pointer ตัวจริงจะเป็น data race)
+// สองฝั่งเลือกต่างกันเพราะเหตุต่างกัน: ฝั่ง Dequeue การถือ pointer ร่วมเกิดจากตัวคิวเอง
+// ฝั่ง Enqueue เกิดจากวินัยของผู้เรียก ซึ่ง doc บังคับได้
 type Job struct {
 	ID       string    // ต้องไม่ซ้ำ; ใช้เป็น idempotency key ฝั่ง handler ด้วย
 	Payload  []byte    // ควรเล็ก (< 2KB — เกณฑ์ TOAST ของ PG); ของใหญ่เก็บ S3 ส่งแค่ key
@@ -315,8 +320,9 @@ func (q *MemQueue) Nack(id string, delay time.Duration, cause error) error {
 	return nil
 }
 
-// Close หยุดรับงานใหม่และปลุก Dequeue ทุกตัวให้คืน ErrClosed
-// งานใน delayed ถูกทิ้ง — ยอมรับได้เพราะคิวนี้อยู่ในหน่วยความจำอยู่แล้ว
+// Close หยุดรับงานใหม่และปลุก Dequeue ทุกตัว. ready ที่ค้างถูก drain ต่อจนหมดก่อนได้
+// ErrClosed — รวมถึง delayed ที่ **ถึงเวลาแล้ว** ณ ตอนเรียก Dequeue (promote ทำงานปกติ)
+// ตัวที่ยังไม่ถึงเวลาไม่มีใครรอ = ถูกทิ้ง — ยอมรับได้เพราะคิวนี้อยู่ในหน่วยความจำอยู่แล้ว
 func (q *MemQueue) Close() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -425,8 +431,9 @@ func (q *MemQueue) Stats() Stats {
 	return s
 }
 
-// Dead คืนสำเนาของ DLQ — สำเนาลึกถึงตัว Job เพื่อให้ replay ทำได้ตรง ๆ:
-// ส่งตัวที่ได้กลับเข้า Enqueue ได้เลยโดยไม่ทำให้ *Job ตัวเดียวอยู่ทั้งใน dead และในคิว
+// Dead คืนสำเนาของ DLQ ไว้ *ดู* — สำเนาลึกถึงตัว Job จึงส่งกลับเข้า Enqueue ได้
+// โดยไม่ทำให้ *Job ตัวเดียวอยู่ทั้งใน dead และในคิว แต่ตัวเดิมจะค้างใน DLQ
+// และถูกนับใน Stats().Dead ต่อ — จะ replay ให้ใช้ TakeDead ที่ดึงออกจริง
 //
 // มี side effect เช่นเดียวกับ Stats โดยตั้งใจ: promote ก่อนอ่านเสมอ (I2c)
 // งานลง DLQ ได้จากใน promoteLocked → ถ้าไม่ promote ก่อน Dead() กับ Stats().Dead
@@ -442,6 +449,27 @@ func (q *MemQueue) Dead() []*Job {
 		cp := *j
 		out[i] = &cp
 	}
+	return out
+}
+
+// TakeDead ดึงงานออกจาก DLQ สูงสุด n ตัว (เก่าสุดก่อน — ตัวที่เกิดตอนปัญหาเริ่ม)
+// พร้อมโอนความเป็นเจ้าของ: ตัวที่ได้ไม่อยู่ในคิวแล้ว ส่งกลับเข้า Enqueue ได้ตรง ๆ
+// (Enqueue รีเซ็ต Attempt ให้โควตาใหม่) โดย Stats().Dead ไม่นับงานเดิมซ้ำสอง
+// และ DLQ ได้ที่ว่างกลับมาเก็บหลักฐานงานล้มตัวใหม่ — n ≤ 0 คืน nil
+//
+// replay ทีละชุดตาม §6.8: for _, j := range q.TakeDead(100) { q.Enqueue(j) }
+// มี side effect เช่นเดียวกับ Dead() โดยตั้งใจ: promote ก่อนตัดสิน (I2c)
+func (q *MemQueue) TakeDead(n int) []*Job {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.promoteLocked(time.Now())
+	n = max(min(n, len(q.dead)), 0) // ตัดขอบทั้งสองด้านโดยไม่มี branch: เกิน = ทั้งหมด, ติดลบ = ศูนย์
+	out := append([]*Job(nil), q.dead[:n]...)
+	rest := copy(q.dead, q.dead[n:])
+	for i := rest; i < len(q.dead); i++ {
+		q.dead[i] = nil // กัน backing array ถือ pointer ค้าง — เหตุผลเดียวกับ jobHeap.Pop
+	}
+	q.dead = q.dead[:rest]
 	return out
 }
 

@@ -140,20 +140,21 @@ func checkInvariants(tb testing.TB, q *MemQueue, when string) {
 
 // model นับงานแบบ "บัญชีคู่": ทุกงานที่เข้ามาต้องอยู่ที่ใดที่หนึ่งเสมอ ห้ามหายไปเฉย ๆ
 //
-//	enqueued = acked + dead + dropped + (ready + delayed + inflight)
+//	enqueued = acked + taken + dead + dropped + (ready + delayed + inflight)
 //
+// (taken = ออกจากระบบทาง TakeDead — replay กลับเข้ามานับเป็น enqueued รอบใหม่)
 // กฎข้อนี้จับบั๊กที่ invariant เชิงโครงสร้างจับไม่ได้: งานที่ถูก heap.Remove
 // ด้วย index ผิดจะหายไปทั้งที่ทุกโครงสร้างยัง "ถูกต้อง" ในตัวมันเอง
-type model struct{ enqueued, acked int }
+type model struct{ enqueued, acked, taken int }
 
 func (m *model) check(tb testing.TB, q *MemQueue, when string) {
 	tb.Helper()
 	s := q.Stats()
-	got := m.acked + s.Dead + int(s.DeadDropped) + s.Ready + s.Delayed + s.Inflight
+	got := m.acked + m.taken + s.Dead + int(s.DeadDropped) + s.Ready + s.Delayed + s.Inflight
 	if got != m.enqueued {
 		tb.Fatalf("กฎอนุรักษ์พังหลัง %s: enqueue ไป %d แต่นับได้ %d "+
-			"(acked=%d dead=%d dropped=%d ready=%d delayed=%d inflight=%d) — มีงานหายไปจากระบบ",
-			when, m.enqueued, got, m.acked, s.Dead, s.DeadDropped, s.Ready, s.Delayed, s.Inflight)
+			"(acked=%d taken=%d dead=%d dropped=%d ready=%d delayed=%d inflight=%d) — มีงานหายไปจากระบบ",
+			when, m.enqueued, got, m.acked, m.taken, s.Dead, s.DeadDropped, s.Ready, s.Delayed, s.Inflight)
 	}
 }
 
@@ -173,7 +174,7 @@ func driveOps(tb testing.TB, q *MemQueue, ops []byte, sleep func(time.Duration))
 	}
 
 	for i := 0; i+1 < len(ops); i += 2 {
-		op, arg := ops[i]%7, ops[i+1]
+		op, arg := ops[i]%8, ops[i+1]
 		what := fmt.Sprintf("op[%d]=%d(%d)", i/2, op, arg)
 
 		switch op {
@@ -230,6 +231,21 @@ func driveOps(tb testing.TB, q *MemQueue, ops []byte, sleep func(time.Duration))
 			for _, d := range q.Dead() {
 				d.Attempt, d.LastErr = -999, "แก้จากข้างนอก"
 			}
+
+		case 7: // TakeDead + replay ครึ่งหนึ่ง — เส้นทางที่ §6.8 แนะนำ
+			taken := q.TakeDead(int(arg%3) - 1) // -1..1: ยิงทั้งขอบติดลบ ศูนย์ และดึงจริง
+			m.taken += len(taken)
+			if arg%2 == 0 {
+				for _, d := range taken {
+					switch err := q.Enqueue(d); {
+					case err == nil:
+						m.enqueued++ // เข้าระบบรอบใหม่ — ฝั่ง taken ไม่ลด (ดูสมการของ model)
+					case errors.Is(err, ErrFull): // งานหายแบบตั้งใจ — ยังอยู่ในบัญชี taken
+					default:
+						tb.Fatalf("%s: replay Enqueue = %v", what, err)
+					}
+				}
+			}
 		}
 
 		checkInvariants(tb, q, what)
@@ -270,6 +286,8 @@ func FuzzQueueOps(f *testing.F) {
 	f.Add([]byte{0, 0, 1, 0, 3, 0, 5, 30, 1, 0, 2, 0}) // nack → รอ → dequeue ซ้ำ
 	f.Add([]byte{0, 0, 1, 0, 5, 39, 2, 0, 4, 0})       // lease หมด แล้วค่อย ack/extend
 	f.Add([]byte{0, 3, 0, 3, 0, 3, 1, 0, 1, 0, 6, 0})  // ชน capacity
+	// enqueue → nack จนครบโควตา (maxAttempt=3) → ลง DLQ → TakeDead + replay
+	f.Add([]byte{0, 0, 1, 0, 3, 0, 1, 0, 3, 0, 1, 0, 3, 0, 7, 2})
 	f.Fuzz(func(t *testing.T, ops []byte) {
 		if len(ops) > 400 { // จำกัดขนาดเพื่อให้แต่ละรอบเร็ว — fuzzer ชอบ input สั้นอยู่แล้ว
 			ops = ops[:400]

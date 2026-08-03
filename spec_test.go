@@ -493,12 +493,18 @@ func TestClosedQueueSemantics(t *testing.T) {
 		if err := q.Ack(j.ID); err != nil {
 			t.Errorf("Ack หลัง Close = %v — ทุก method ต้องยังทำงานได้ ไม่ deadlock", err)
 		}
-		// งาน delayed ถูกทิ้งตามที่ doc บอก — Dequeue ไม่รอให้ถึง RunAt
+		// delayed ที่ **ยังไม่ถึงเวลา** ถูกทิ้งตามที่ doc บอก — Dequeue ไม่รอให้ถึง RunAt
 		if _, err := q.Dequeue(context.Background()); !errors.Is(err, ErrClosed) {
-			t.Errorf("= %v, ต้องการ ErrClosed (งาน delayed ถูกทิ้งตอนปิด)", err)
+			t.Errorf("= %v, ต้องการ ErrClosed (Dequeue ไม่รอ delayed ตอนปิด)", err)
 		}
 		if s := q.Stats(); s.Delayed != 1 {
 			t.Errorf("Stats หลัง Close = %+v — ต้องยังตอบได้ ไม่ deadlock", s)
+		}
+		// แต่ delayed ที่ **ถึงเวลาแล้ว** ก่อนการเรียก Dequeue ครั้งถัดไป ยังถูก drain —
+		// Close ไม่รอของที่ยังไม่พร้อม แต่ก็ไม่ทิ้งของที่พร้อมแล้ว (doc ของ Close)
+		time.Sleep(time.Hour)
+		if j, err := q.Dequeue(context.Background()); err != nil || j.ID != "delayed" {
+			t.Errorf("delayed ที่ถึงเวลาแล้วหลัง Close ต้องถูก drain: %+v, %v", j, err)
 		}
 	})
 }
@@ -831,6 +837,170 @@ func TestDeadPromotesBeforeReporting(t *testing.T) {
 			t.Errorf("Stats().Dead = %d แต่ len(Dead()) = %d ในวินาทีเดียวกัน", s.Dead, len(dead))
 		}
 	})
+}
+
+// ── §3.4 TakeDead: ระบาย DLQ — ครึ่งหลังของเรื่อง replay ────────────────
+
+// fillDLQ ส่งงานลง DLQ ทีละตัวตามลำดับ id (คิวต้องมี maxAttempt=1)
+func fillDLQ(t *testing.T, q *MemQueue, ids ...string) {
+	t.Helper()
+	for _, id := range ids {
+		mustEnqueue(t, q, &Job{ID: id})
+		j := mustDequeue(t, q)
+		if err := q.Nack(j.ID, 0, errors.New("boom")); err != nil {
+			t.Fatalf("fillDLQ(%s): %v", id, err)
+		}
+	}
+	if s := q.Stats(); s.Inflight != 0 {
+		t.Fatalf("fillDLQ: %+v", s)
+	}
+}
+
+// ฆ่า mutant: ลบ `q.dead = q.dead[:rest]` (DLQ ไม่หด — Stats.Dead ค้าง),
+// สลับทิศ copy (ได้ตัวใหม่สุดแทนตัวเก่าสุด — หลักฐานตอนปัญหาเริ่มหาย)
+func TestTakeDeadDrainsOldestFirst(t *testing.T) {
+	q := NewMemQueue(10, 1, time.Minute)
+	fillDLQ(t, q, "a", "b", "c")
+
+	got := q.TakeDead(2)
+	if len(got) != 2 || got[0].ID != "a" || got[1].ID != "b" {
+		t.Fatalf("TakeDead(2) = %v, ต้องการ [a b] (เก่าสุดก่อน)", got)
+	}
+	if s := q.Stats(); s.Dead != 1 {
+		t.Errorf("หลังดึง 2 จาก 3: Stats().Dead = %d, ต้องการ 1", s.Dead)
+	}
+	if rest := q.Dead(); len(rest) != 1 || rest[0].ID != "c" {
+		t.Errorf("ตัวที่เหลือ = %v, ต้องการ [c]", rest)
+	}
+	if again := q.TakeDead(10); len(again) != 1 || again[0].ID != "c" {
+		t.Errorf("รอบสอง = %v, ต้องการ [c] — ตัวที่ดึงไปแล้วต้องไม่กลับมา", again)
+	}
+}
+
+// ฆ่า mutant: `0` → `1` ใน max(..., 0) (ขอ 0 ได้ 1), ลบ `n = max(min(...))` ทิ้ง
+// (n ติดลบ/เกิน → panic จากการ slice) — ขอบเขตทุกด้านต้องนิ่งเพราะ n มาจากผู้ใช้
+func TestTakeDeadBounds(t *testing.T) {
+	q := NewMemQueue(10, 1, time.Minute)
+	fillDLQ(t, q, "a")
+
+	for _, n := range []int{0, -1, -999} {
+		if got := q.TakeDead(n); got != nil {
+			t.Errorf("TakeDead(%d) = %v, ต้องการ nil", n, got)
+		}
+	}
+	if s := q.Stats(); s.Dead != 1 {
+		t.Fatalf("n ≤ 0 ต้องไม่แอบหยิบ: Stats().Dead = %d", s.Dead)
+	}
+	if got := q.TakeDead(999); len(got) != 1 {
+		t.Fatalf("TakeDead(999) = %v, ต้องการทั้งหมด (1 ตัว) ไม่ใช่ panic", got)
+	}
+	if got := q.TakeDead(1); got != nil {
+		t.Errorf("DLQ ว่างแล้ว = %v, ต้องการ nil", got)
+	}
+}
+
+// ฆ่า mutant: ลบ `q.promoteLocked(...)` — งานที่ lease หมดครบโควตาเพิ่งลง DLQ
+// ต้องถูกดึงได้ทันทีโดยไม่ต้องมีใครเรียก Stats/Dead คั่นก่อน (I2c เหมือน Dead)
+func TestTakeDeadPromotesBeforeTaking(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		q := NewMemQueue(10, 1, time.Second)
+		mustEnqueue(t, q, &Job{ID: "j"})
+		mustDequeue(t, q)
+		time.Sleep(2 * time.Second) // lease หมด → promote → ครบโควตา → DLQ
+
+		if got := q.TakeDead(1); len(got) != 1 || got[0].ID != "j" {
+			t.Errorf("TakeDead = %v, ต้องเห็น j โดยไม่ต้องพึ่ง traffic อื่นมา promote ให้", got)
+		}
+	})
+}
+
+// TakeDead แตะเฉพาะงานใน DLQ — สถานะอื่นต้องไม่กระทบ (ตาราง §2.3)
+func TestTakeDeadOnlyTouchesDLQ(t *testing.T) {
+	for _, st := range []state{stNone, stDelayed, stReady, stInflight} {
+		t.Run(string(st), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				q := setup(t, st)
+				before := q.Stats()
+				if got := q.TakeDead(10); got != nil {
+					t.Fatalf("TakeDead จากสถานะ %s = %v, ต้องการ nil", st, got)
+				}
+				if after := q.Stats(); after != before {
+					t.Errorf("สถานะ %s ถูกกระทบ: ก่อน %+v หลัง %+v", st, before, after)
+				}
+			})
+		})
+	}
+	t.Run(string(stDLQ), func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			q := setup(t, stDLQ)
+			if got := q.TakeDead(10); len(got) != 1 || got[0].ID != specID {
+				t.Fatalf("TakeDead จาก DLQ = %v, ต้องการ [%s]", got, specID)
+			}
+		})
+	})
+}
+
+// เรื่องเต็มของ replay ที่ Dead() ทำไม่ได้: ดึงออก → หลักฐานไม่นับซ้ำ →
+// DLQ ได้ที่ว่างกลับมาเก็บงานล้มตัวใหม่ (DeadDropped หยุดโต) → โควตา retry ใหม่
+func TestTakeDeadReplayRoundTrip(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		q := NewMemQueue(2, 1, time.Minute) // DLQ มีขอบ = capacity = 2
+		fillDLQ(t, q, "a", "b")             // DLQ เต็มพอดี
+		fillDLQ(t, q, "c")                  // ตกขอบ → dropped
+		if s := q.Stats(); s.Dead != 2 || s.DeadDropped != 1 {
+			t.Fatalf("ก่อนระบาย: %+v", s)
+		}
+
+		taken := q.TakeDead(2)
+		if len(taken) != 2 || taken[0].LastErr != "boom" {
+			t.Fatalf("TakeDead = %+v, ต้องได้ [a b] พร้อม LastErr ไว้วินิจฉัย", taken)
+		}
+		// replay ตรง ๆ ด้วยตัวที่ได้ — ID ถูกปล่อยตอนลง DLQ แล้ว จึงไม่ ErrDuplicateID
+		mustEnqueue(t, q, taken[0])
+		j := mustDequeue(t, q)
+		if j.ID != "a" || j.Attempt != 1 {
+			t.Fatalf("replay ได้ %+v, ต้องการ a ที่ Attempt=1 (โควตาใหม่)", j)
+		}
+		if s := q.Stats(); s.Dead != 0 {
+			t.Errorf("ระหว่าง replay: Stats().Dead = %d — งานเดิมต้องไม่ถูกนับซ้ำ", s.Dead)
+		}
+		if err := q.Ack(j.ID); err != nil {
+			t.Fatalf("Ack: %v", err)
+		}
+
+		// ที่ว่างกลับมาแล้ว: งานล้มตัวใหม่ถูกเก็บ ไม่ตกขอบเพิ่ม
+		fillDLQ(t, q, "d")
+		if s := q.Stats(); s.Dead != 1 || s.DeadDropped != 1 {
+			t.Errorf("หลังระบาย: %+v — d ต้องถูกเก็บ และ DeadDropped ต้องไม่เพิ่ม", s)
+		}
+	})
+}
+
+// ฆ่า mutant: ลบ `q.dead[i] = nil` — เหตุผลเดียวกับ TestPoppedJobNotRetained:
+// backing array ของ dead ที่ถือ *Job ที่ดึงออกไปแล้วคือ memory leak ที่ Stats มองไม่เห็น
+func TestTakenDeadJobNotRetained(t *testing.T) {
+	q := NewMemQueue(10, 1, time.Minute)
+	ref := func() weak.Pointer[Job] {
+		j := &Job{ID: "ใหญ่", Payload: make([]byte, 1<<16)}
+		mustEnqueue(t, q, j)
+		k := mustDequeue(t, q)
+		if err := q.Nack(k.ID, 0, errors.New("boom")); err != nil {
+			t.Fatalf("Nack: %v", err)
+		}
+		if got := q.TakeDead(1); len(got) != 1 {
+			t.Fatalf("TakeDead = %v", got)
+		}
+		return weak.Make(j)
+	}()
+
+	for range 3 {
+		runtime.GC()
+	}
+	alive := ref.Value() != nil
+	runtime.KeepAlive(q) // เหตุผลเดียวกับ TestPoppedJobNotRetained: ต้องอ้าง q หลัง GC
+	if alive {
+		t.Error("งานที่ TakeDead ออกไปแล้วยังถูก dead ถือไว้ — backing array ไม่ถูกล้าง")
+	}
 }
 
 // handler ต้องถูกตัดด้วย timeout ต่อหนึ่งงาน และต้องได้ ctx ที่ **มี deadline** จริง
