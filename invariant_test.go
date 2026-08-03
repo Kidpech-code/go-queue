@@ -191,7 +191,7 @@ func driveOps(tb testing.TB, q *MemQueue, ops []byte, sleep func(time.Duration))
 				tb.Fatalf("%s: Enqueue = %v", what, err)
 			}
 
-		case 1: // Dequeue — เช็ค Ready ก่อนเพื่อไม่ให้บล็อก (goroutine เดียว จึงไม่มีใครมาแย่ง)
+		case 1: // Dequeue — เช็ก Ready ก่อนเพื่อไม่ให้บล็อก (goroutine เดียว จึงไม่มีใครมาแย่ง)
 			if q.Stats().Ready == 0 {
 				continue
 			}

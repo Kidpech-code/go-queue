@@ -126,7 +126,7 @@ worker ต้องทำสองอย่าง: **(A) ทำงาน** (ต�
 
 - Kafka EOS ทำได้เพราะ A และ B อยู่ใน Kafka ทั้งคู่ (read→process→write กลับ Kafka)
 - Postgres queue + Postgres side effect ก็ทำได้ ด้วยเหตุผลเดียวกัน ([§6.3](#63-idempotency-ไม่ใช่-nice-to-have))
-- **ส่งอีเมล / เรียก Stripe** อยู่นอก transaction เสมอ → การันตีหายทันที
+- **ส่งอีเมล / เรียก Stripe** อยู่นอก transaction เสมอ → การันตีนั้นหายทันที
 
 > **ผลตามมาที่หลีกเลี่ยงไม่ได้: handler ต้อง idempotent เสมอ ไม่มีข้อยกเว้น**
 > ทุกอย่างที่เหลือคือรายละเอียดของการทำให้ข้อนี้ทำได้จริง
@@ -141,7 +141,7 @@ worker ต้องทำสองอย่าง: **(A) ทำงาน** (ต�
 | Consumer ตาย | broker ต้องตรวจจับ | ไม่ต้องทำอะไร — แค่ไม่มีใครมาขอ |
 
 **Pull ชนะเกือบทุกกรณี.** ปัญหาเดียวคือ polling เปลืองถ้าคิวว่าง — แก้ด้วย **long-poll**:
-ผู้ขอบล็อกรออยู่ที่ broker จนกว่าจะมีงานหรือหมดเวลา
+consumer บล็อกรออยู่ที่ broker จนกว่าจะมีงานหรือหมดเวลา
 
 - SQS: `ReceiveMessage(WaitTimeSeconds: 20)`
 - Postgres: `LISTEN` + `WaitForNotification`
@@ -165,7 +165,7 @@ FIFO ทั้งคิวแบบเข้มงวด **บังคับใ
 **ความขัดแย้งที่หลีกเลี่ยงไม่ได้:** ถ้างาน B ล้มและต้อง retry ในคิวที่ต้อง FIFO
 มีทางเลือกแค่สองทาง และทั้งคู่แย่:
 
-1. **บล็อกทั้ง partition** จนกว่า B จะสำเร็จ → งาน C, D, E ค้างตามไปด้วย
+1. **บล็อกทั้งคิว** จนกว่า B จะสำเร็จ → งาน C, D, E ค้างตามไปด้วย
    (SQS FIFO ทำแบบนี้: message group ค้างทั้งกลุ่ม)
 2. **ข้าม B ไปทำ C** แล้วส่ง B ไป retry topic → **ลำดับพัง**
    (Kafka + retry topic ทำแบบนี้)
@@ -298,8 +298,8 @@ DLQ → มนุษย์ดู last_error → แก้บั๊ก/แก้�
 | **I1** | งาน 1 ชิ้นอยู่ได้ที่เดียว: `ready ⊎ delayed ⊎ leases ⊎ dead` | ทุกการย้ายทำใต้ `q.mu` เดียวกัน และ `Pop` แล้วค่อย `Push` เสมอ | `Job.index` ชี้ผิด heap → `heap.Remove` **ลบงานอื่นทิ้งเงียบ ๆ** |
 | **I2** | `id ∈ inflight` ⟺ `job ∈ leases` | `Ack`/`Nack`/`promoteLocked` แก้ทั้งสองที่ในบล็อกเดียว | งานค้าง inflight ตลอดกาล (memory leak) หรือ lease หมดแล้วไม่มีใครกู้ |
 | **I2b** | `Job.ID` ไม่ซ้ำกันในหมู่งานที่ยังไม่จบ | `ids map[string]struct{}` + `ErrDuplicateID` ใน `Enqueue` | **พบบั๊กจริงตอนรีวิว:** ID ซ้ำทำให้ `inflight[id]` ถูกเขียนทับ → `Stats` รายงาน `Inflight=1` ทั้งที่ dequeue ไป 2, `capacity` นับต่ำกว่าจริง, และงานที่ ack ไปแล้วกลับมาถูกทำซ้ำหลัง lease หมด |
-| **I2c** | ทุก method ที่แตะสถานะ `promoteLocked()` ก่อน | บรรทัดแรกของ `Dequeue`/`Ack`/`Nack`/`Extend`/`Stats`/`Dead` | **พบตอนรีวิว:** ถ้าไม่ promote `Ack` ที่มาช้า 10 นาทีจะยังสำเร็จ ตราบใดที่ไม่มีใครเรียก `Dequeue` คั่น ⇒ พฤติกรรมขึ้นกับ traffic ที่ไม่เกี่ยวข้อง = ทดสอบไม่ได้ |
-| **I3** | `Attempt` เพิ่มที่ **`Dequeue`** เท่านั้น | บรรทัดเดียวใน `Dequeue` | งานที่ทำ worker crash จะวนตลอดกาลโดย `Attempt` ไม่ขึ้น → ไม่มีวันถึง DLQ |
+| **I2c** | ทุก method ที่แตะสถานะต้องเรียก `promoteLocked()` ก่อน | บรรทัดแรกของ `Dequeue`/`Ack`/`Nack`/`Extend`/`Stats`/`Dead` | **พบตอนรีวิว:** ถ้าไม่ promote `Ack` ที่มาช้า 10 นาทีจะยังสำเร็จ ตราบใดที่ไม่มีใครเรียก `Dequeue` คั่น ⇒ พฤติกรรมขึ้นกับ traffic ที่ไม่เกี่ยวข้อง = ทดสอบไม่ได้ |
+| **I3** | `Attempt` เพิ่มที่ **`Dequeue`** เท่านั้น | บรรทัดเดียวใน `Dequeue` | งานที่ทำให้ worker crash จะวนตลอดกาลโดย `Attempt` ไม่ขึ้น → ไม่มีวันถึง DLQ |
 | **I4** | `enqueued` ไม่ถูกรีเซ็ตตอน retry | `if j.enqueued.IsZero()` ใน `Enqueue` | `OldestReady` วัดแค่ตั้งแต่ retry รอบล่าสุด → **มองไม่เห็นงานที่ค้างมา 3 ชั่วโมง** |
 | **I5** | ไม่ถือ mutex ขณะเรียก handler | `Dequeue` `Unlock` ก่อน `return` | คิวทั้งใบหยุดตามเวลาที่ handler ใช้ = concurrency กลายเป็น 1 |
 | **I6** | `capacity` นับรวม `inflight` ด้วย | `sizeLocked()` | รับงานเข้ามาเกินที่ระบบทำไหว → ย้อนไปข้อ [§1.5](#15-bounded-เสมอ--และ-4-นโยบายเมื่อเต็ม) |
@@ -423,7 +423,7 @@ type Queue interface {
 > **สองกฎของ interface ใน Go:**
 > 1. **ประกาศที่ฝั่งผู้ใช้ ไม่ใช่ฝั่งผู้ให้บริการ** — package ที่ *ใช้* คิวเป็นคนนิยามว่าต้องการอะไร
 > 2. **ถ้ามี implementation เดียว อย่าใส่ interface** — ได้แค่ indirection
->    ทำให้ jump-to-definition ใน IDE พาไปผิดที่ และ mock ที่ไม่มีใครใช้
+>    ที่ทำให้ jump-to-definition ใน IDE พาไปผิดที่ และ mock ที่ไม่มีใครใช้
 
 ### 3.3 โครงสร้างข้อมูลในหน่วยความจำ
 
@@ -486,7 +486,7 @@ c: RunAt=t+9, Priority=5
 | ค้นเชิงเส้นแล้ว `Remove` | `O(n)` ต่อ Ack | Ack คือ hot path — เกิดทุกงาน |
 | **lazy deletion** (ปล่อยค้างใน heap แล้วข้ามตอน pop) | `O(1)` Ack แต่ heap บวม | ที่ 1,000 job/s + VT 30s → **30,000 entry ขยะค้างตลอดเวลา** |
 
-เลือก `index` เพราะ **ประหยัดโค้ดไม่กี่บรรทัดแล้วได้ความถูกต้องบน edge case**
+เลือก `index` เพราะ **จ่ายโค้ดไม่กี่บรรทัดแล้วได้ความถูกต้องบน edge case**
 — นี่คือกรณีที่ "ขี้เกียจ" แปลว่าเขียนน้อย ไม่ใช่เลือกอัลกอริทึมที่เปราะกว่า
 
 #### ทำไม `chan` ไม่พอ
@@ -588,7 +588,7 @@ t3  worker A: ทำงานเสร็จ → Backoff(j.Attempt)     (อ่�
 
 | ทางเลือก | ทำไมไม่เอา |
 |---|---|
-| ใส่ `sync.Mutex` ใน `Job` | ล็อกต่องาน + ผู้ใช้ต้องรู้ว่าต้องล็อกก่อนอ่าน = API ที่ผิดได้ |
+| ใส่ `sync.Mutex` ใน `Job` | ล็อกต่องาน + ผู้ใช้ต้องรู้ว่าต้องล็อกก่อนอ่าน = API ที่ใช้ผิดได้ |
 | ใส่ `atomic.Int64` ที่ `Attempt` | แก้ได้ฟิลด์เดียว `LastErr`/`RunAt` ยังแข่งกันอยู่ |
 | เอกสารว่า "ห้ามอ่าน `j.Attempt`" | `RunPool` ในไฟล์เดียวกันก็ยังอ่าน — เอกสารไม่บังคับใคร |
 | **คืนสำเนา** | +1 alloc, +3% ns/op, ไม่มีทางใช้ผิด ✅ |
@@ -658,7 +658,7 @@ ready: jobHeap{less: func(a, b *Job) bool {
    จะลบงานอื่นทิ้ง **เงียบ ๆ** ไม่มี panic ไม่มี log — บั๊กประเภทที่ใช้เวลาหาเป็นวัน
 
 > **`heap.Fix` vs `heap.Remove`:** ถ้าแค่ *เปลี่ยนค่า* ของ element ที่อยู่ใน heap แล้ว
-> (เช่นเลื่อน priority) ใช้ `heap.Fix(h, i)` — `O(log n)` เหมือนกัน แต่ไม่ต้อง Remove+Push
+> (เช่น เลื่อน priority) ใช้ `heap.Fix(h, i)` — `O(log n)` เหมือนกัน แต่ไม่ต้อง Remove+Push
 > repo นี้ไม่ใช้เพราะไม่มีการแก้ค่าในที่
 
 ### 4.2 Delay queue — min-heap + timer **ตัวเดียว**
@@ -761,7 +761,7 @@ func (q *MemQueue) broadcastLocked() {
 
 // ── ผู้รอ ──
 q.mu.Lock()
-/* ...เช็คเงื่อนไข: มีงานไหม? ปิดหรือยัง?... */
+/* ...เช็กเงื่อนไข: มีงานไหม? ปิดหรือยัง?... */
 wake := q.wake                 // ★ จับ ref ใต้ล็อกเดียวกับผู้ปลุก
 q.mu.Unlock()
 select {
@@ -781,10 +781,10 @@ case <-ctx.Done():             // ★ ยกเลิกได้จริง �
 
 | กรณี | เกิดอะไร |
 |---|---|
-| `t_close < t_capture` | ผู้ปลุกปิด channel เก่าและสร้างใหม่ไปแล้ว. ผู้รอจับ channel *ใหม่* — แต่ผู้รอก็เช็คเงื่อนไขใต้ล็อกเดียวกัน**หลัง**การเปลี่ยนสถานะ ⇒ **เห็นงานแล้ว ไม่เข้า select เลย** |
+| `t_close < t_capture` | ผู้ปลุกปิด channel เก่าและสร้างใหม่ไปแล้ว. ผู้รอจับ channel *ใหม่* — แต่ผู้รอก็เช็กเงื่อนไขใต้ล็อกเดียวกัน**หลัง**การเปลี่ยนสถานะ ⇒ **เห็นงานแล้ว ไม่เข้า select เลย** |
 | `t_capture < t_close` | ผู้รอถือ channel ที่ยังไม่ปิด. เมื่อผู้ปลุกปิด **channel ตัวนั้นเอง** ⇒ `select` ผ่านทันที ไม่ว่า `t_close` จะอยู่ก่อนหรือหลัง `t_select` |
 
-**ไม่มีช่องว่าง** เพราะการเช็คเงื่อนไขกับการจับ `wake` เป็น atomic เมื่อเทียบกับผู้ปลุก
+**ไม่มีช่องว่าง** เพราะการเช็กเงื่อนไขกับการจับ `wake` เป็น atomic เมื่อเทียบกับผู้ปลุก
 
 #### ทางเลือกที่มีบั๊ก (อย่าทำ)
 
@@ -802,7 +802,7 @@ select { case notify <- struct{}{}: default: }   // "signal"
 #### ทำไมต้องมี `for` ครอบ
 
 broadcast ปลุก N ตัวเพื่องาน 1 ชิ้น — **spurious wakeup by design**
-ตัวที่แพ้ต้องวนไปเช็คใหม่ หลักการเดียวกับ `while (!cond) pthread_cond_wait()`
+ตัวที่แพ้ต้องวนไปเช็กใหม่ หลักการเดียวกับ `while (!cond) pthread_cond_wait()`
 
 **ต้นทุน:** N worker ตื่นพร้อมกันแย่ง mutex เพื่องาน 1 ชิ้น = `O(N)` context switch เสียเปล่า
 ที่ N ≤ ~100 ไม่มีนัยสำคัญ; ที่ N > 1,000 ควรเปลี่ยนไปทำ waiter queue แบบ FIFO
@@ -914,7 +914,7 @@ full jitter:
 ส่วน decorrelated ต้องพก `prev` ไปกับงาน ซึ่งหายไปพร้อม worker ที่ตาย
 
 > ผลข้างเคียงที่ **ตั้งใจ**: full jitter คืนค่าใกล้ 0 ได้ ⇒ retry ทันที
-> ถ้ารับไม่ได้ (เช่นต้องเว้นอย่างน้อย 1 วิเสมอ) ให้ใช้ `base + rand(0, d)`
+> ถ้ารับไม่ได้ (เช่น ต้องเว้นอย่างน้อย 1 วิเสมอ) ให้ใช้ `base + rand(0, d)`
 
 ### 4.6 Worker pool + panic guard + graceful shutdown
 
@@ -956,10 +956,10 @@ func safeCall(ctx context.Context, timeout time.Duration, h Handler, j *Job) (er
 #### รายละเอียดที่สำคัญ
 
 **`wg.Add(1)` ต้องอยู่ก่อน `go`** — ถ้าเขียน `go func(){ wg.Add(1); ... }()`
-จะมีหน้าต่างที่ `wg.Wait()` เห็น counter = 0 แล้วผ่านไปเลย ทั้งที่ goroutine ยังไม่เริ่ม
+จะมีช่วงเวลาที่ `wg.Wait()` เห็น counter = 0 แล้วผ่านไปเลย ทั้งที่ goroutine ยังไม่เริ่ม
 
 **`recover` ทำงานเฉพาะใน goroutine ของตัวเอง** — ถ้า handler ไปเรียก
-`go func(){ ... }()` แล้ว panic ข้างใน `safeCall` ช่วยไม่ได้ **โปรเซสตายทั้งใบ**
+`go func(){ ... }()` แล้ว panic ข้างใน goroutine นั้น `safeCall` ช่วยไม่ได้ **โปรเซสตายทั้งใบ**
 (นี่คือดีไซน์ตั้งใจของ Go: panic ที่ไม่มีคนรับ = โปรแกรมอยู่ในสถานะที่ไว้ใจไม่ได้)
 
 **`err` ต้องเป็น named return** — `recover()` ใน `defer` แก้ค่าที่จะคืนได้ก็ต่อเมื่อ
@@ -1083,9 +1083,9 @@ RETURNING id, payload, attempt, max_attempt, lease_token;
 #### สองคำเตือนจากเอกสาร PostgreSQL เองที่ต้องรู้
 
 > **1. `SKIP LOCKED` ให้มุมมองข้อมูลที่ไม่สอดคล้อง (inconsistent view)**
-> เอกสาร PG ระบุตรง ๆ ว่า *"...จึงไม่เหมาะกับงานทั่วไป แต่ใช้เพื่อเลี่ยง lock contention
-> เมื่อมีผู้บริโภคหลายรายเข้าถึงตารางที่ทำหน้าที่เป็นคิวได้"*
-> — แปลว่า **อย่าใช้รูปแบบนี้กับ query ที่ต้องการคำตอบครบถ้วน** (เช่นรายงาน, การนับยอด)
+> เอกสาร PG ระบุตรง ๆ ว่า *"...จึงไม่เหมาะกับงานทั่วไป แต่ใช้เพื่อเลี่ยง lock contention ได้
+> เมื่อมีผู้บริโภคหลายรายเข้าถึงตารางที่ทำหน้าที่เป็นคิว"*
+> — แปลว่า **อย่าใช้รูปแบบนี้กับ query ที่ต้องการคำตอบครบถ้วน** (เช่น รายงาน, การนับยอด)
 > มันถูกออกแบบมาเพื่อคิวโดยเฉพาะ ซึ่งคือกรณีของเราพอดี
 
 > **2. locking clause ใน sub-SELECT ล็อกเฉพาะแถวที่ถูกส่งคืนให้ query ชั้นนอก**
@@ -1143,9 +1143,9 @@ Postgres ปิดช่องนี้ **ฟรี** — นี่คือเ�
 | # | ปัญหา | อาการ | วิธีแก้ |
 |---|---|---|---|
 | 1 | **ตารางบวม (bloat)** — คิวคือ UPDATE/DELETE หนัก ทุก UPDATE สร้าง tuple ใหม่ทิ้งตัวเก่าเป็นขยะ | `Dequeue` ค่อย ๆ ช้าลงเป็นสัปดาห์ | `ALTER TABLE jobs SET (autovacuum_vacuum_scale_factor = 0.01, autovacuum_vacuum_cost_delay = 0);` |
-| 2 | **transaction ค้าง (`idle in transaction`)** | vacuum เก็บขยะไม่ได้ **ทั้งดาต้าเบส** เพราะ xmin horizon ค้าง | ตั้ง `idle_in_transaction_session_timeout = '30s'`; ห้ามเปิด tx คร่อมการเรียก external API |
-| 3 | **polling เปลืองเปล่า** | CPU ของ DB เต็มไปด้วย query ที่ไม่เจออะไร | `LISTEN`/`NOTIFY` + `pgx` `WaitForNotification` — **ต้องมี ticker สำรอง** (เช่นทุก 5 วิ) เพราะ NOTIFY ไม่ durable: ไม่มี listener ตอนนั้น สัญญาณหายเลย (payload จำกัด 8,000 ไบต์ด้วย) |
-| 4 | **payload ใหญ่** — แถวเกิน ~**2 KB** จะถูก TOAST (บีบอัด/ย้ายออกนอกหน้า) | อ่านช้าลงชัด, WAL บวม | **claim check**: เก็บของจริงใน S3 ใส่แค่ key ในคิว |
+| 2 | **transaction ค้าง (`idle in transaction`)** | vacuum เก็บขยะไม่ได้ **ทั้งฐานข้อมูล** เพราะ xmin horizon ค้าง | ตั้ง `idle_in_transaction_session_timeout = '30s'`; ห้ามเปิด tx คร่อมการเรียก external API |
+| 3 | **polling เปลืองเปล่า** | CPU ของ DB เต็มไปด้วย query ที่ไม่เจออะไร | `LISTEN`/`NOTIFY` + `pgx` `WaitForNotification` — **ต้องมี ticker สำรอง** (เช่น ทุก 5 วิ) เพราะ NOTIFY ไม่ durable: ไม่มี listener ตอนนั้น สัญญาณหายเลย (payload จำกัด 8,000 ไบต์ด้วย) |
+| 4 | **payload ใหญ่** — แถวเกิน ~**2 KB** จะถูก TOAST (บีบอัด/ย้ายออกนอก page) | อ่านช้าลงชัดเจน, WAL บวม | **claim check**: เก็บของจริงใน S3 ใส่แค่ key ในคิว |
 | 5 | **deploy แล้วงานเก่าค้างในคิว** | consumer ใหม่ unmarshal payload เก่าไม่ได้ → poison pill ทั้งกอง | `payload` ต้องมี `"v": 1` เสมอ; consumer ใหม่ต้องอ่านของเก่าออกได้อย่างน้อย 1 เวอร์ชัน |
 | 6 | **connection pool หมด** | worker block รอ connection = worker ที่ตายแล้ว | `SetMaxOpenConns` ≥ จำนวน worker + margin; อย่าลืมว่า handler ก็ใช้ connection |
 | 7 | **DELETE vs UPDATE state='done'** | ตารางโตไม่หยุด, index บวม | **`DELETE` ทันทีที่ Ack**; ถ้าต้องเก็บประวัติให้ `INSERT INTO jobs_archive` ใน tx เดียวกัน |
@@ -1173,12 +1173,12 @@ UPDATE jobs SET state       = CASE WHEN attempt >= max_attempt THEN 'dead' ELSE 
 WHERE id = $1 AND lease_token = $4;
 ```
 
-**ทั้งสอง query ต้องเช็ค `rows affected`** — ได้ 0 แถวแปลว่าเสีย lease ไปแล้ว
+**ทั้งสอง query ต้องเช็ก `rows affected`** — ได้ 0 แถวแปลว่าเสีย lease ไปแล้ว
 เทียบเท่า `ErrNotInflight` ของ `MemQueue` ⇒ ต้องนับเป็น `AckTooLate` และ**หยุดทำงานทันที**
 
 #### ทำไม `WHERE id = $1` เฉย ๆ ไม่พอ — fencing token
 
-`MemQueue` เช็ค `q.inflight[id]` ก่อนทุกครั้ง ⇒ worker ที่เสีย lease ไปแล้ว `Ack`/`Nack` ไม่ได้
+`MemQueue` เช็ก `q.inflight[id]` ก่อนทุกครั้ง ⇒ worker ที่เสีย lease ไปแล้ว `Ack`/`Nack` ไม่ได้
 ถ้าแปลเป็น SQL แบบตรงตัวว่า `DELETE FROM jobs WHERE id = $1` **การป้องกันนั้นหายไปทั้งหมด**:
 
 ```
@@ -1190,12 +1190,12 @@ t3  worker A: ฟื้น → DELETE FROM jobs WHERE id = 42
     ⇒ at-least-once กลายเป็น at-most-once เงียบ ๆ  ← งานหาย
 ```
 
-`Nack` แย่กว่า: worker A ที่ล้าสมัย reset งานของ B กลับเป็น `'ready'` ทั้งที่ B ยังทำอยู่
+`Nack` แย่กว่า: worker A ที่เสีย lease ไปแล้ว reset งานของ B กลับเป็น `'ready'` ทั้งที่ B ยังทำอยู่
 ⇒ งานถูกทำพร้อมกันสองที่โดยที่ระบบคิดว่ามีตัวเดียว
 
 `lease_token` คือ **fencing token** ตัวเดียวกับที่ SQS เรียก *receipt handle*:
 เกิดใหม่ทุกครั้งที่ dequeue ⇒ ตั๋วของ A ใช้ไม่ได้แล้วตั้งแต่ reaper ล้างมันทิ้ง
-(เช็ค `lease_until > now()` แทนไม่พอ เพราะ B ต่ออายุ lease ไปแล้ว เงื่อนไขจึงเป็นจริงอีกครั้ง)
+(เช็ก `lease_until > now()` แทนไม่พอ เพราะ B ต่ออายุ lease ไปแล้ว เงื่อนไขจึงเป็นจริงอีกครั้ง)
 
 ### 5.5 เมื่อไหร่ Postgres ไม่พอ
 
@@ -1218,10 +1218,10 @@ depth =    100 ที่      1 job/s → รอ 100 วินาที     🔥
 ```
 
 **depth เพียงอย่างเดียวไม่มีความหมาย** เพราะไม่รู้อัตราการระบาย
-`oldest_ready_seconds` รวมข้อมูลทั้งสองไว้แล้วในตัวเลขเดียว และเป็นสิ่งที่ผู้ใช้รู้สึกจริง
+`oldest_ready_seconds` รวมข้อมูลทั้งสองไว้แล้วในตัวเลขเดียว และเป็นสิ่งที่ผู้ใช้รู้สึกได้จริง
 
 ```
-queue_oldest_ready_seconds   gauge      ← ★ ตั้ง alert ที่นี่ (SLI ตัวเดียวที่พอ)
+queue_oldest_ready_seconds   gauge      ← ★ ตั้ง alert ที่นี่ (SLI ตัวเดียวก็พอ)
 queue_depth{state}           gauge      ← ไว้ debug: ready/delayed/inflight/dead
 job_duration_seconds         histogram  ← หา handler ที่ช้า (p50/p95/p99)
 job_total{outcome}           counter    ← success | retry | dead
@@ -1471,7 +1471,7 @@ Priority ไม่ช่วย เพราะทุกงานของ tenant
 |---|---|
 | คิวยาวขึ้นเรื่อย ๆ | เพิ่ม worker ก่อน (ถ้า downstream รับไหว); ถ้าไม่ไหว → เปิด reject ที่ producer |
 | DLQ พุ่ง | **หยุด producer ก่อน** แล้วดู `q.Dead()[0].LastErr` — มักเป็นสาเหตุเดียวกันทั้งกอง (DLQ เก็บ N ตัว*แรก* จึงเป็นตัวที่เกิดตอนปัญหาเริ่ม ไม่ใช่ตอนท่วมแล้ว) |
-| งานทำซ้ำผิดปกติ | เช็ค `ack_too_late_total` → ขยาย VT ทันที ([§6.4](#64-งานที่ยาวกว่า-visibility-timeout-จะถูกทำซ้ำตลอดกาล)) |
+| งานทำซ้ำผิดปกติ | เช็ก `ack_too_late_total` → ขยาย VT ทันที ([§6.4](#64-งานที่ยาวกว่า-visibility-timeout-จะถูกทำซ้ำตลอดกาล)) |
 | deploy แล้ว unmarshal พัง | rollback; งานที่ค้างจะกลับมาเองหลัง lease หมด ([§5.4](#54-สิ่งที่ต้องทำ-ไม่งั้นเจ็บ) ข้อ 5) |
 | ต้อง replay DLQ | `UPDATE jobs SET state='ready', attempt=0, run_at=now() WHERE state='dead' AND id = ANY($1)` — **ทีละชุด อย่ายิงหมดทีเดียว** |
 
@@ -1506,11 +1506,11 @@ Priority ไม่ช่วย เพราะทุกงานของ tenant
 | `inflight` นับรวมใน `capacity` | ไม่รับงานเกินที่ระบบทำไหว ([I6](#24-invariant-ที่ต้องเป็นจริงตลอดเวลา)) |
 | `h.jobs[n-1] = nil` ใน `Pop` | ไม่ให้ backing array ถือ pointer ค้าง |
 | `!After(now)` ไม่ใช่ `Before(now)` | เงื่อนไขขอบ inclusive สำหรับ deadline ([§4.4](#44-lease--visibility-timeout--ไม่ต้องมี-reaper-goroutine)) |
-| ทุก method `promoteLocked()` ก่อน | พฤติกรรมไม่ขึ้นกับ traffic ที่ไม่เกี่ยวข้อง ([I2c](#24-invariant-ที่ต้องเป็นจริงตลอดเวลา)) |
+| ทุก method เรียก `promoteLocked()` ก่อน | พฤติกรรมไม่ขึ้นกับ traffic ที่ไม่เกี่ยวข้อง ([I2c](#24-invariant-ที่ต้องเป็นจริงตลอดเวลา)) |
 | `Extend` broadcast **เฉพาะตอนย่น lease** | heartbeat เป็น path ที่ถี่ที่สุด; ปลุกทุกครั้ง = ช้าลง 14 เท่าที่ 512 waiter ([§8.3b](#83b-เพดานของ-mutation-testing--และบั๊กจริงสองตัวที่มันมองไม่เห็น)) |
-| `Nack` รับ `cause error` แทนให้ worker เขียน `j.LastErr` เอง | worker ที่เสีย lease ไปแล้วอาจเขียน `*Job` ตัวเดียวกับ worker ใหม่ = data race |
+| `Nack` รับ `cause error` แทนที่จะให้ worker เขียน `j.LastErr` เอง | worker ที่เสีย lease ไปแล้วอาจเขียน `*Job` ตัวเดียวกับ worker ใหม่ = data race |
 | **`Dequeue`/`Dead()` คืนสำเนา ไม่ใช่ pointer ตัวจริง** | คิวเขียน `Attempt`/`leaseUntil` ต่อหลังแจกงาน — `RunPool` เองก็อ่าน `j.Attempt` นอกล็อก ([§3.6](#36-ขอบเขตความเป็นเจ้าของ-ทำไม-dequeue-ต้องคืนสำเนา)) |
-| **`Dequeue` เช็ค `ctx.Err()` ก่อนดู `ready`** | ไม่งั้น SIGTERM = worker กวาด `ready` ทั้งกองมาเผา `Attempt`; deploy 5 ครั้ง × `maxAttempt=5` = งานลง DLQ ทั้งที่ไม่เคยรัน |
+| **`Dequeue` เช็ก `ctx.Err()` ก่อนดู `ready`** | ไม่งั้น SIGTERM = worker กวาด `ready` ทั้งกองมาเผา `Attempt`; deploy 5 ครั้ง × `maxAttempt=5` = งานลง DLQ ทั้งที่ไม่เคยรัน |
 | `NewMemQueue` panic เมื่อ config ผิด | `visibility=0` ทำให้ทุกงานหมด lease ทันทีที่ถูกหยิบ — ต้องรู้ตอนบูต ไม่ใช่ตอนตีสาม |
 | `Enqueue` รีเซ็ต `Attempt = 0` | replay จาก `Dead()` ต้องได้โควตาใหม่ ไม่ใช่เด้งกลับ DLQ ทันทีที่ล้มครั้งแรก |
 | `Enqueue` ปฏิเสธ ID ว่าง | ไม่งั้นงานที่ลืมใส่ ID จองสล็อต `""` แล้วตัวถัดไปเจอ `ErrDuplicateID` ที่ไม่สื่ออะไร |
@@ -1522,7 +1522,7 @@ Priority ไม่ช่วย เพราะทุกงานของ tenant
 
 | ไม่สร้าง | ทำไม | สร้างเมื่อ |
 |---|---|---|
-| **Sharding คิวเป็น N ส่วน** | วัดได้ 880k job/s ที่ 8 worker; [§0](#0-เลือกก่อนเขียนโค้ด) ส่งงาน >2k job/s ไป Postgres อยู่แล้ว | `pprof -mutex` ชี้ว่า lock contention เป็นคอขวด **จริง** ไม่ใช่คาดว่าจะเป็น |
+| **Sharding คิวเป็น N ส่วน** | วัดได้ 880k job/s ที่ 8 worker; [§0](#0-เลือกก่อนเขียนโค้ด) ชี้ให้งาน >2k job/s ไป Postgres อยู่แล้ว | `pprof -mutex` ชี้ว่า lock contention เป็นคอขวด **จริง** ไม่ใช่คาดว่าจะเป็น |
 | **Waiter queue แบบ FIFO** | ได้ผลเมื่อ worker > ~64 ซึ่งตาม Little's Law คือ >1,280 job/s — ควรไป shard/Postgres แทน | รัน worker หลายร้อยตัวแล้วยังไปต่อไม่ได้ |
 | **Per-key ordering** | [§1.4](#14-ordering--และเหตุผลที่-fifo-กับ-retry-ขัดกันโดยธรรมชาติ) พิสูจน์แล้วว่าขัดกับ retry โดยธรรมชาติ — แยกคิวถูกกว่าและตรวจสอบง่ายกว่า | ต้องการลำดับต่อ key **และ** ยอมรับ head-of-line blocking ในกลุ่มนั้น |
 | **heap ที่ 4 ให้ `Stats` เป็น O(1)** | `Stats()` เรียกทุก 10 วินาที — เพิ่มโครงสร้างเพื่อ path ที่ไม่ร้อนคือนิยามของ over-engineering | `Stats()` โผล่ใน CPU profile |
@@ -1609,7 +1609,7 @@ go func() { j, _ := q.Dequeue(ctx); got <- j.ID }()   // waiter ยังไม�
 q.Enqueue(&Job{ID: "j"})                              // ← สัญญาณปลุกออกไปก่อนมีคนรอ
 ```
 
-ถ้าไม่ `synctest.Wait()` คั่น เทสจะผ่านทั้งที่ **ลบ `broadcastLocked()` ทิ้งทั้งบรรทัด**
+ถ้าไม่มี `synctest.Wait()` คั่น เทสจะผ่านทั้งที่ **ลบ `broadcastLocked()` ทิ้งทั้งบรรทัด**
 เพราะ waiter ไปเจองานเองตอนวนรอบแรก ไม่เคยได้ทดสอบเส้นทาง "ถูกปลุก" เลย
 
 ### 8.2 Mutation testing — วัดว่าเทส "จับบั๊กได้จริงไหม"
@@ -1624,12 +1624,12 @@ invalid  = คอมไพล์ไม่ผ่าน (ไม่นับ — �
 mutation score = killed / (killed + survived)
 ```
 
-`tools/mutate` (~200 บรรทัด, `go/ast` ล้วน, ไม่มี dependency) ทำงานดังนี้:
+`tools/mutate` (~550 บรรทัด, `go/ast` ล้วน, ไม่มี dependency) ทำงานดังนี้:
 
 1. parse `queue.go` แล้วเดิน AST เก็บ "จุดกลายพันธุ์" ทั้งหมด — ได้ **164 จุด**
 2. worker แต่ละตัวคัดลอกแพ็กเกจไป temp dir ของตัวเอง → กลายพันธุ์พร้อมกันได้โดยไม่ชนกัน
 3. `printer.Fprint` เขียนโค้ดที่กลายพันธุ์แล้ว → `go test -count=1 .`
-4. mutant ที่ทำให้ค้าง (เช่นลบ `Attempt++` จนงานวนไม่จบ) นับเป็น **killed** — timeout คือการจับได้
+4. mutant ที่ทำให้ค้าง (เช่น ลบ `Attempt++` จนงานวนไม่จบ) นับเป็น **killed** — timeout คือการจับได้
 
 | operator | ตัวอย่าง | จับบั๊กประเภทไหน |
 |---|---|---|
@@ -1647,7 +1647,7 @@ make mutate     # → killed 141 · survived 0 · equivalent 16 · invalid 7 →
 #### Equivalent mutant — ปัญหาที่ตัดสินด้วยเครื่องจักรไม่ได้
 
 mutant บางตัว "รอด" เพราะ **แก้แล้วโปรแกรมเหมือนเดิมจริง ๆ** ไม่ใช่เพราะเทสอ่อน
-เช่นบรรทัดนี้:
+เช่น บรรทัดนี้:
 
 ```go
 if a.Priority != b.Priority {
@@ -1671,7 +1671,7 @@ queue.go:MemQueue.promoteLocked:ลบ q.broadcastLocked()#0
 ไฟล์นี้คือช่องทางเดียวที่ทำให้ประตู 100% ผ่าน — ใส่มั่วเมื่อไหร่คือปิดตาตัวเองเมื่อนั้น
 
 > **ผลพลอยได้ที่ไม่ได้ตั้งใจ:** การพิสูจน์ความสมมูลบังคับให้ต้องอ่านโค้ดในระดับที่
-> รีวิวปกติไม่ไปถึง — 18 ตัวที่เหลือกลายเป็นเอกสารว่า "บรรทัดไหนคือ defence in depth
+> รีวิวปกติไม่ไปถึง — 16 ตัวที่เหลือกลายเป็นเอกสารว่า "บรรทัดไหนคือ defence in depth
 > และมันซ้ำซ้อนกับอะไร" ซึ่งเป็นความรู้ที่ปกติหายไปกับคนเขียน
 
 ### 8.3 บั๊กจริงที่ mutation หาเจอ — และเทสที่อุดมัน
@@ -1679,7 +1679,7 @@ queue.go:MemQueue.promoteLocked:ลบ q.broadcastLocked()#0
 45 mutant ที่รอดในรอบแรก ยุบเป็นรูเชิงตรรกะได้ตามนี้ **ทุกแถวคือบั๊กที่ merge ผ่านได้จริง
 ตอน coverage 99%**:
 
-| # | แก้โค้ดว่าอะไร | พังยังไงในโปรดักชัน | ทำไมเทสเดิมไม่จับ | เทสที่อุด |
+| # | แก้โค้ดอย่างไร | พังยังไงในโปรดักชัน | ทำไมเทสเดิมไม่จับ | เทสที่อุด |
 |---|---|---|---|---|
 | 1 | ลบ `j.RunAt = now.Add(delay)` ใน `retryLocked` | **backoff ถูกเพิกเฉยทั้งระบบ** — DB ที่ล่มโดนถล่มซ้ำทันที | เทสเดิม `Nack` ด้วย `delay=0` ทุกที่ | `TestNackDelayIsHonored` |
 | 2 | ลบ `promoteLocked()` ออกจาก `Ack`/`Nack`/`Extend`/`Stats` | พฤติกรรมขึ้นกับว่ามีใครเรียก `Dequeue` คั่นหรือไม่ ([I2c](#24-invariant-ที่ต้องเป็นจริงตลอดเวลา)) | ทุกเทสมี `Dequeue` คั่นอยู่แล้วโดยบังเอิญ | `TestPromoteBeforeEveryDecision` |
@@ -1691,9 +1691,9 @@ queue.go:MemQueue.promoteLocked:ลบ q.broadcastLocked()#0
 | 8 | ลบ `timer.Reset(d)` ใน `Dequeue` | waiter ที่ **แพ้การแย่งงาน** หลับตลอดกาล | ต้องมี waiter ≥2 ตัวถึงจะมีคนแพ้ | `TestLosingWaiterRearmsTimer` |
 | 9 | ลบ `q.Ack(j.ID)` / `q.Nack(...)` ใน `RunPool` | งานถูกทำซ้ำทุกครั้งที่ lease หมด / ไม่มีวันถึง DLQ | เทสเดิมตั้ง visibility สั้น — **lease หมดอายุกลบร่องรอยให้พอดี** | `TestRunPoolAcksAndNacks` (ตั้ง lease = 1 ชม.) |
 | 10 | ลบ `wg.Wait()` ใน `RunPool` | `RunPool` คืนค่าขณะงานยังทำอยู่ = graceful shutdown เป็นคำโกหก | ไม่มีเทสไหนตรวจว่า worker ออกหมดจริง | `TestRunPoolWaitsForWorkers` |
-| 11 | `100 * time.Millisecond` → `100 / time.Millisecond`, `<<` → `>>` | backoff เป็น ~0 เสมอ → retry ถล่มปลายทางที่กำลังฟื้น | `TestBackoffBounds` เช็คแค่ "อยู่ในช่วง [0, ceiling]" ซึ่ง **0 ก็อยู่ในช่วง** | `TestBackoffGrowsAndSaturates` |
+| 11 | `100 * time.Millisecond` → `100 / time.Millisecond`, `<<` → `>>` | backoff เป็น ~0 เสมอ → retry ถล่มปลายทางที่กำลังฟื้น | `TestBackoffBounds` เช็กแค่ "อยู่ในช่วง [0, ceiling]" ซึ่ง **0 ก็อยู่ในช่วง** | `TestBackoffGrowsAndSaturates` |
 | 12 | `capacity < 1` → `<= 1`, `visibility <= 0` → `<= 1` | คิวปฏิเสธ config ที่ถูกต้องตอนบูต | เทสเดิมยืนยันแค่ "ค่าผิดต้อง panic" ไม่เคยยืนยัน "ค่าถูกต้องไม่ panic" | `TestConfigBoundaryAccepted` |
-| 13 | ลบ `q.ackTooLate++` ใน `Ack`/`Nack` | SLI ที่บอกว่า visibility สั้นไปเงียบไปครึ่งหนึ่ง | เทสเดิมเช็คเฉพาะเส้นทาง `Extend` | `TestAckTooLateCountsEveryPath` |
+| 13 | ลบ `q.ackTooLate++` ใน `Ack`/`Nack` | SLI ที่บอกว่า visibility สั้นไป เงียบไปครึ่งหนึ่ง | เทสเดิมเช็กเฉพาะเส้นทาง `Extend` | `TestAckTooLateCountsEveryPath` |
 | 14 | ลบ `h.jobs[n-1] = nil` ใน `Pop` | backing array ถือ `*Job` ค้าง → **RAM ค้างที่ระดับ peak ตลอดไป** ทั้งที่ `Stats` บอกคิวว่าง | สังเกตจากพฤติกรรมไม่ได้ ต้องดูที่การถือหน่วยความจำ | `TestPoppedJobNotRetained` (`weak.Pointer` + `runtime.GC`) |
 
 > **บทเรียนที่ซ้ำที่สุดในตารางนี้:** เทสหลายตัว "ผ่านด้วยเหตุผลที่ผิด" —
@@ -1719,7 +1719,7 @@ queue.go:MemQueue.promoteLocked:ลบ q.broadcastLocked()#0
 | 4 | `promoteLocked` ระบายทีละตัวแทนที่จะระบายหมด | งาน delayed 10k ตัวที่ถึงเวลาพร้อมกัน ต้องรอ 10k รอบกว่าจะระบายหมด — ดูเหมือนคิวค้าง | ต้องเปลี่ยน `for` เป็น `if` ซึ่งไม่ใช่ operator ที่มี | `TestPromoteDrainsEverythingDue` |
 | 5 | tie-break ใช้ `enqueued` แทน `seq` | **replay DLQ 10k ตัวแซงหน้า traffic สดทั้งหมด** (I4 บอกว่า `enqueued` ไม่ถูกรีเซ็ต → งาน replay เก่าที่สุดเสมอ) | ต้องเปลี่ยนไปใช้ฟิลด์คนละตัว | `TestFIFOTieBreakIsSeqNotAgeOrAttempt` |
 | 6 | tie-break ใช้ `Attempt` แทน `seq` | งานที่ล้มบ่อยได้คิวหน้าเรื่อย ๆ = starvation กลับด้าน | เหมือนข้อ 5 | เดียวกัน |
-| 7 | `jobHeap.Pop` ไม่ตั้ง `index = -1` | sentinel หายไป — `heap.Remove` ตัวถัดไปอาจแตะงานผิดตัว | `retryLocked` เขียนค่าเดียวกันซ้ำให้ → สอง statement ครอบกันเอง เทสผ่าน `MemQueue` แยกไม่ออก | `TestHeapPopClearsIndex` (เทส `jobHeap` ตรง ๆ) |
+| 7 | `jobHeap.Pop` ไม่ตั้ง `index = -1` | sentinel หายไป — `heap.Remove` ตัวถัดไปอาจแตะงานผิดตัว | `retryLocked` เขียนค่าเดียวกันซ้ำให้ → สอง statement ครอบกันเอง เทสที่ผ่าน `MemQueue` แยกไม่ออก | `TestHeapPopClearsIndex` (เทส `jobHeap` ตรง ๆ) |
 
 **B1 กับ B2 แก้แล้วทั้งคู่** และมีเทสเฝ้าไว้ทั้งคู่ — B2 คือหนึ่งบรรทัด
 (`q.promoteLocked(time.Now())` ใน `Dead`) ส่วน B1 ต้องมีเงื่อนไข:
@@ -1891,7 +1891,7 @@ input ที่ทำให้พังจะถูกเขียนลง `tes
 ### 8.6 บังคับใน CI — ทั้งหมดเป็น "ประตู" ไม่ใช่ "รายงาน"
 
 ```bash
-make ci      # lint + race + cover + mutate — ทุกตัวแดงแล้วห้าม merge
+make ci      # lint + race + cover + mutate — แดงตัวเดียวก็ห้าม merge
 ```
 
 | ประตู | คำสั่ง | เกณฑ์ | ทำไมต้องเป็นประตู |
@@ -1922,7 +1922,7 @@ repo เป็น public และ `codecov-action@v5` รองรับกา�
   ทั้งหัวข้อนี้มีไว้เพื่อประโยคเดียวนั้น)
 
 > **ราคาที่จ่าย:** `queue.go` 498 บรรทัด ↔ เทส 2,097 บรรทัด (115 test case)
-> ↔ เครื่องมือ 524 บรรทัด + เทสของเครื่องมือ 551 บรรทัด (อัตราส่วน 1 : 4.2 : 2.2). `make mutate` ใช้เวลา ~3 นาทีบน M4 10 cores
+> ↔ เครื่องมือ 548 บรรทัด + เทสของเครื่องมือ 622 บรรทัด (อัตราส่วน 1 : 4.2 : 2.3). `make mutate` ใช้เวลา ~2 นาทีบน M4 10 cores.
 > สำหรับโค้ดที่ถ้าพังแล้วงานของลูกค้าหาย — นี่คือราคาที่ถูก
 
 ---
@@ -1972,7 +1972,7 @@ func main() {
 	<-ctx.Done()
 	slog.Info("ได้รับสัญญาณหยุด — กำลัง drain")
 
-	// worker หยุดรับงานใหม่ทันทีที่ ctx ถูกยกเลิก (Dequeue เช็ค ctx ก่อน ready)
+	// worker หยุดรับงานใหม่ทันทีที่ ctx ถูกยกเลิก (Dequeue เช็ก ctx ก่อน ready)
 	// งานที่เหลือใน ready/delayed จึงคงอยู่ครบ ไม่ถูกกวาดมาเผา Attempt ทิ้ง
 	select {
 	case <-pool:
@@ -2007,7 +2007,7 @@ func handle(ctx context.Context, j *queue.Job) error {
 
 **สิ่งที่ตัวอย่างนี้แสดงครบ:** `signal.NotifyContext` (stdlib), metric ตัวที่สำคัญที่สุด,
 graceful shutdown 2 จังหวะที่ timeout เรียงถูก, payload versioning, idempotency key,
-และการปล่อยให้ error กลไก retry/DLQ จัดการเองแทนที่จะ log แล้วกลืน
+และการปล่อยให้กลไก retry/DLQ จัดการ error เอง แทนที่จะ log แล้วกลืน
 
 ---
 

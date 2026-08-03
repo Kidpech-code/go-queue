@@ -402,7 +402,7 @@ func TestDeadJobsReplayCleanly(t *testing.T) {
 
 // ── Shutdown ต้องไม่กินโควตา retry ของงานที่ยังค้างคิว ─────────────────
 
-// เดิม Dequeue เช็ค ready ก่อนเช็ค ctx → หลัง SIGTERM worker กวาด ready
+// เดิม Dequeue เช็ก ready ก่อนเช็ก ctx → หลัง SIGTERM worker กวาด ready
 // ทั้งกองมา nack ทิ้ง; deploy 5 ครั้งกับ maxAttempt=5 = งานลง DLQ ทั้งที่ไม่เคยรัน
 func TestCancelledCtxTakesNoJob(t *testing.T) {
 	const n = 20

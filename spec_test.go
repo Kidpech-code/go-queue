@@ -753,7 +753,7 @@ func TestPoppedJobNotRetained(t *testing.T) {
 	}
 }
 
-// ── ตัวช่วย: เทสที่ไม่เช็ค error คือเทสที่ผ่านตอนโค้ดพัง ──────────────────
+// ── ตัวช่วย: เทสที่ไม่เช็ก error คือเทสที่ผ่านตอนโค้ดพัง ──────────────────
 
 func mustEnqueue(t *testing.T, q *MemQueue, j *Job) {
 	t.Helper()

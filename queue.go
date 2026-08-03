@@ -190,7 +190,7 @@ func (q *MemQueue) Dequeue(ctx context.Context) (*Job, error) {
 
 	for { // วนเพราะ broadcast ปลุก waiter ทุกตัว แต่งานมีชิ้นเดียว (spurious wakeup by design)
 		if err := ctx.Err(); err != nil {
-			return nil, err // เช็คก่อนแตะคิว: ยกเลิกแล้วต้องไม่รับงานเพิ่ม
+			return nil, err // เช็กก่อนแตะคิว: ยกเลิกแล้วต้องไม่รับงานเพิ่ม
 		}
 		q.mu.Lock()
 		now := time.Now()
