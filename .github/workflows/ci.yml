@@ -26,18 +26,25 @@ jobs:
 
   cover:
     runs-on: ubuntu-latest
+    env:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with: { go-version-file: go.mod, cache: true }
       - run: make cover
       # อัปโหลดโปรไฟล์เดียวกับที่ประตูใช้ — ตัวเลขบน Codecov กับใน CI จึงตรงกันเสมอ
-      - uses: codecov/codecov-action@v5
+      #
+      # ข้ามอย่าง **มีเสียง** (ชื่อ step บอกตรง ๆ) เมื่อยังไม่ตั้ง CODECOV_TOKEN:
+      # push ตรงเข้า main อัปโหลดแบบไม่มี token ไม่ได้แล้ว (นโยบาย Codecov ปัจจุบัน)
+      # ประตู coverage จริงคือ make cover ข้างบน — แดงเมื่อต่ำกว่า 100% เสมอไม่ว่า token จะมีไหม
+      # พอตั้ง secret แล้ว step นี้กลับมารันเอง และ fail_ci_if_error ทำให้อัปโหลดล้ม = CI แดง
+      - name: Upload to Codecov (ข้ามจนกว่าจะตั้ง secret CODECOV_TOKEN)
+        if: env.CODECOV_TOKEN != ''
+        uses: codecov/codecov-action@v5
         with:
           files: ./coverage.out
           fail_ci_if_error: true
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: coverage, path: coverage.out }
