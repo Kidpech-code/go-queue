@@ -30,8 +30,11 @@ jobs:
 
   cover:
     runs-on: ubuntu-latest
-    env:
-      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+    # id-token ให้ job ขอ OIDC token จาก GitHub ได้ — Codecov ตรวจตัวตนจากตรงนั้น
+    # จึงไม่ต้องมี CODECOV_TOKEN เลย (repo public): ไม่มี secret = ไม่มีของให้หมุน/ให้รั่ว
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -40,16 +43,13 @@ jobs:
         with: { go-version-file: go.mod, cache: true, cache-dependency-path: go.mod }
       - run: make cover
       # อัปโหลดโปรไฟล์เดียวกับที่ประตูใช้ — ตัวเลขบน Codecov กับใน CI จึงตรงกันเสมอ
-      #
-      # ข้ามอย่าง **มีเสียง** (ชื่อ step บอกตรง ๆ) เมื่อยังไม่ตั้ง CODECOV_TOKEN:
-      # push ตรงเข้า main อัปโหลดแบบไม่มี token ไม่ได้แล้ว (นโยบาย Codecov ปัจจุบัน)
-      # ประตู coverage จริงคือ make cover ข้างบน — แดงเมื่อต่ำกว่า 100% เสมอไม่ว่า token จะมีไหม
-      # พอตั้ง secret แล้ว step นี้กลับมารันเอง และ fail_ci_if_error ทำให้อัปโหลดล้ม = CI แดง
-      - name: Upload to Codecov (ข้ามจนกว่าจะตั้ง secret CODECOV_TOKEN)
-        if: env.CODECOV_TOKEN != ''
+      # ประตู coverage จริงคือ make cover ข้างบน — แดงเมื่อต่ำกว่า 100% เสมอ
+      # fail_ci_if_error: อัปโหลดล้มต้องเห็น ไม่ใช่เงียบแล้วปล่อยให้กราฟบน Codecov ค้างของเก่า
+      - name: Upload to Codecov
         uses: codecov/codecov-action@v5
         with:
           files: ./coverage.out
+          use_oidc: true
           fail_ci_if_error: true
       - uses: actions/upload-artifact@v4
         if: always()
