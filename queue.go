@@ -282,8 +282,8 @@ func (q *MemQueue) Extend(id string, d time.Duration) error {
 	// เงื่อนไขนี้ไม่ใช่การรีดประสิทธิภาพเล่น ๆ — heartbeat คือ path ที่ถูกเรียกถี่ที่สุดของ
 	// งานยาว (ทุก visibility/3) และ broadcast ปลุก waiter **ทุกตัว**
 	//
-	// วัดได้ที่ BenchmarkExtendHeartbeat512Waiters: 2,177 ns/op · 1 alloc ถ้าปลุกทุกครั้ง
-	// เทียบกับ 115 ns/op · 0 alloc เมื่อมีเงื่อนไข (เร็วขึ้น 19 เท่า)
+	// วัดได้ที่ BenchmarkExtendHeartbeat512Waiters: ~2,180 ns/op · 1 alloc ถ้าปลุกทุกครั้ง
+	// เทียบกับ ~122 ns/op · 0 alloc เมื่อมีเงื่อนไข (เร็วขึ้น ~18 เท่า)
 	// เทสทั้งชุดเขียวทั้งสองแบบ — benchmark คือสิ่งเดียวที่เห็นความต่าง
 	if j.leaseUntil.Before(prev) {
 		q.broadcastLocked()

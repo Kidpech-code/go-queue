@@ -547,24 +547,24 @@ ch := make(chan Job, 4)        runtime.hchan
 
 | สถานการณ์ | ns/op | throughput | allocs/op |
 |---|---|---|---|
-| `chan` เปล่า 8 worker (เส้นฐาน) | 264 | ~3.8M job/s | 2 |
-| MemQueue 1 worker | 583 | ~1.7M job/s | 5 |
-| MemQueue 8 worker | 1,170 | **~855k job/s** | 5 |
-| MemQueue 64 worker | 3,310 | ~302k job/s | 6 |
-| MemQueue 512 worker | 13,461 | ~74k job/s | 6 |
+| `chan` เปล่า 8 worker (เส้นฐาน) | 273 | ~3.7M job/s | 3 |
+| MemQueue 1 worker | 571 | ~1.75M job/s | 5 |
+| MemQueue 8 worker | 1,199 | **~834k job/s** | 5 |
+| MemQueue 64 worker | 3,605 | ~277k job/s | 6 |
+| MemQueue 512 worker | 14,345 | ~70k job/s | 6 |
 
 **อ่านตัวเลขนี้ยังไง:**
 
 1. **ราคาของ feature ทั้งชุด ≈ 4.4×** เทียบกับ `chan` เปล่าที่ 8 worker
    — ถ้าไม่ต้องการ priority/delay/lease/DLQ ก็อย่าจ่าย ([§0](#0-เลือกก่อนเขียนโค้ด))
 2. **throughput ตกตามจำนวน worker** เพราะ broadcast ปลุกทุกคนเพื่องานชิ้นเดียว
-   ([§4.3](#43-condition-variable-ที่-select-ได้--อัลกอริทึมสำคัญที่สุดในไฟล์)) — ที่ 8 worker ยังสบาย ที่ 512 เหลือ 1/11
+   ([§4.3](#43-condition-variable-ที่-select-ได้--อัลกอริทึมสำคัญที่สุดในไฟล์)) — ที่ 8 worker ยังสบาย ที่ 512 เหลือราว 1/12
 3. **allocs/op เกือบคงที่ทุกจำนวน worker** — เพราะ `Dequeue` ใช้ `time.Timer` ตัวเดียวแล้ว `Reset`
    ก่อนแก้จุดนี้ ตัวเลขคือ **31 allocs/op และ 2,527 B/op ที่ 512 worker**
    (timer ที่ waiter สร้างใหม่ทุกครั้งที่ถูกปลุกแล้วกลับไปนอน)
-4. **1 alloc ในนั้นคือสำเนา `Job` ที่ `Dequeue` คืน** (~3% ของ ns/op, +160 B/op) —
+4. **1 alloc ในนั้นคือสำเนา `Job` ที่ `Dequeue` คืน** (~6% ของ ns/op, +160 B/op) —
    ราคาของการไม่แชร์ `*Job` กับ worker ([§3.6](#36-ขอบเขตความเป็นเจ้าของ-ทำไม-dequeue-ต้องคืนสำเนา))
-   ตอนถือ pointer ตัวจริงคือ **4 allocs/op และ 1,170 → 1,132 ns/op** — เร็วขึ้น 3% แลกกับ data race
+   ตอนถือ pointer ตัวจริงคือ **4 allocs/op และ 1,199 → 1,131 ns/op** — เร็วขึ้น ~6% แลกกับ data race
 
 ⇒ **ใช้ได้จริงถึงหลักแสน job/s ที่ worker ไม่เกินหลักสิบ** ซึ่งครอบคลุมเกือบทุกงานจริง
 เกินกว่านั้นให้ shard ([§7](#7-รีวิว-ข้อจำกัดที่รู้ตัว) ข้อ 1) ไม่ใช่ปรับจูนอันนี้
@@ -591,7 +591,7 @@ t3  worker A: ทำงานเสร็จ → Backoff(j.Attempt)     (อ่�
 | ใส่ `sync.Mutex` ใน `Job` | ล็อกต่องาน + ผู้ใช้ต้องรู้ว่าต้องล็อกก่อนอ่าน = API ที่ใช้ผิดได้ |
 | ใส่ `atomic.Int64` ที่ `Attempt` | แก้ได้ฟิลด์เดียว `LastErr`/`RunAt` ยังแข่งกันอยู่ |
 | เอกสารว่า "ห้ามอ่าน `j.Attempt`" | `RunPool` ในไฟล์เดียวกันก็ยังอ่าน — เอกสารไม่บังคับใคร |
-| **คืนสำเนา** | +1 alloc, +3% ns/op, ไม่มีทางใช้ผิด ✅ |
+| **คืนสำเนา** | +1 alloc, +6% ns/op, ไม่มีทางใช้ผิด ✅ |
 
 หลักการเดียวกันใช้กับ `Dead()` — คืนสำเนาลึก ไม่งั้นการ replay
 (`q.Enqueue(q.Dead()[0])`) จะทำให้ `*Job` ตัวเดียวอยู่ทั้งใน DLQ และในคิวพร้อมกัน
@@ -1483,7 +1483,7 @@ Priority ไม่ช่วย เพราะทุกงานของ tenant
 
 | # | ข้อจำกัด | สถานการณ์ที่พังจริง | ยกระดับเมื่อ / อย่างไร |
 |---|---|---|---|
-| 1 | **mutex ตัวเดียวคุมทั้งคิว** | **วัดได้:** 8 worker = ~880k job/s, 64 worker = ~320k, 512 worker = ~88k ([§3.5](#35-ตัวเลขที่วัดได้จริง-apple-m4-10-cores--benchmem)) | โปรไฟล์ (`go tool pprof -mutex`) เจอ contention → shard เป็น N คิวย่อยตาม `hash(ID) % N`, `Dequeue` วนถาม round-robin |
+| 1 | **mutex ตัวเดียวคุมทั้งคิว** | **วัดได้:** 8 worker = ~834k job/s, 64 worker = ~277k, 512 worker = ~70k ([§3.5](#35-ตัวเลขที่วัดได้จริง-apple-m4-10-cores--benchmem)) | โปรไฟล์ (`go tool pprof -mutex`) เจอ contention → shard เป็น N คิวย่อยตาม `hash(ID) % N`, `Dequeue` วนถาม round-robin |
 | 2 | **in-memory ล้วน** | deploy = งานที่ค้างหายหมด รวมถึงงานใน `delayed` และ DLQ | งานห้ามหาย → [§5](#5-production-postgres--skip-locked) |
 | 3 | `Stats()` สแกน `O(n)` | เรียกใน hot loop ที่ n = 100k → หยุดคิวทุกครั้งที่เรียก | เรียกทุก 10 วิเท่านั้น; ถ้าจำเป็นเพิ่ม heap ที่ 4 เรียงตาม `enqueued` |
 | 4 | `Close()` ทิ้งงานใน `delayed` | งาน retry ที่รออยู่หายตอน shutdown | ยอมรับได้ — in-memory หายอยู่แล้ว. ถ้าไม่ยอมรับ = ต้องการ durability = ข้อ 2 |
@@ -1507,7 +1507,7 @@ Priority ไม่ช่วย เพราะทุกงานของ tenant
 | `h.jobs[n-1] = nil` ใน `Pop` | ไม่ให้ backing array ถือ pointer ค้าง |
 | `!After(now)` ไม่ใช่ `Before(now)` | เงื่อนไขขอบ inclusive สำหรับ deadline ([§4.4](#44-lease--visibility-timeout--ไม่ต้องมี-reaper-goroutine)) |
 | ทุก method เรียก `promoteLocked()` ก่อน | พฤติกรรมไม่ขึ้นกับ traffic ที่ไม่เกี่ยวข้อง ([I2c](#24-invariant-ที่ต้องเป็นจริงตลอดเวลา)) |
-| `Extend` broadcast **เฉพาะตอนย่น lease** | heartbeat เป็น path ที่ถี่ที่สุด; ปลุกทุกครั้ง = ช้าลง 14 เท่าที่ 512 waiter ([§8.3b](#83b-เพดานของ-mutation-testing--และบั๊กจริงสองตัวที่มันมองไม่เห็น)) |
+| `Extend` broadcast **เฉพาะตอนย่น lease** | heartbeat เป็น path ที่ถี่ที่สุด; ปลุกทุกครั้ง = ช้าลง ~18 เท่าที่ 512 waiter ([§8.3b](#83b-เพดานของ-mutation-testing--และบั๊กจริงสองตัวที่มันมองไม่เห็น)) |
 | `Nack` รับ `cause error` แทนที่จะให้ worker เขียน `j.LastErr` เอง | worker ที่เสีย lease ไปแล้วอาจเขียน `*Job` ตัวเดียวกับ worker ใหม่ = data race |
 | **`Dequeue`/`Dead()` คืนสำเนา ไม่ใช่ pointer ตัวจริง** | คิวเขียน `Attempt`/`leaseUntil` ต่อหลังแจกงาน — `RunPool` เองก็อ่าน `j.Attempt` นอกล็อก ([§3.6](#36-ขอบเขตความเป็นเจ้าของ-ทำไม-dequeue-ต้องคืนสำเนา)) |
 | **`Dequeue` เช็ก `ctx.Err()` ก่อนดู `ready`** | ไม่งั้น SIGTERM = worker กวาด `ready` ทั้งกองมาเผา `Attempt`; deploy 5 ครั้ง × `maxAttempt=5` = งานลง DLQ ทั้งที่ไม่เคยรัน |
@@ -1522,7 +1522,7 @@ Priority ไม่ช่วย เพราะทุกงานของ tenant
 
 | ไม่สร้าง | ทำไม | สร้างเมื่อ |
 |---|---|---|
-| **Sharding คิวเป็น N ส่วน** | วัดได้ 880k job/s ที่ 8 worker; [§0](#0-เลือกก่อนเขียนโค้ด) ชี้ให้งาน >2k job/s ไป Postgres อยู่แล้ว | `pprof -mutex` ชี้ว่า lock contention เป็นคอขวด **จริง** ไม่ใช่คาดว่าจะเป็น |
+| **Sharding คิวเป็น N ส่วน** | วัดได้ ~834k job/s ที่ 8 worker; [§0](#0-เลือกก่อนเขียนโค้ด) ชี้ให้งาน >2k job/s ไป Postgres อยู่แล้ว | `pprof -mutex` ชี้ว่า lock contention เป็นคอขวด **จริง** ไม่ใช่คาดว่าจะเป็น |
 | **Waiter queue แบบ FIFO** | ได้ผลเมื่อ worker > ~64 ซึ่งตาม Little's Law คือ >1,280 job/s — ควรไป shard/Postgres แทน | รัน worker หลายร้อยตัวแล้วยังไปต่อไม่ได้ |
 | **Per-key ordering** | [§1.4](#14-ordering--และเหตุผลที่-fifo-กับ-retry-ขัดกันโดยธรรมชาติ) พิสูจน์แล้วว่าขัดกับ retry โดยธรรมชาติ — แยกคิวถูกกว่าและตรวจสอบง่ายกว่า | ต้องการลำดับต่อ key **และ** ยอมรับ head-of-line blocking ในกลุ่มนั้น |
 | **heap ที่ 4 ให้ `Stats` เป็น O(1)** | `Stats()` เรียกทุก 10 วินาที — เพิ่มโครงสร้างเพื่อ path ที่ไม่ร้อนคือนิยามของ over-engineering | `Stats()` โผล่ใน CPU profile |
@@ -1744,9 +1744,9 @@ if j.leaseUntil.Before(prev) {   // ★ เฉพาะตอน "ย่น" เ
 
 | waiter ที่บล็อกอยู่ | broadcast ทุกครั้ง | เฉพาะตอนย่น |
 |---|---|---|
-| 0 | 134.5 ns/op · 1 alloc | **113.8 ns/op · 0 alloc** |
-| 64 | 1,004 ns/op · 1 alloc | **114.3 ns/op · 0 alloc** |
-| 512 | 2,177 ns/op · 1 alloc | **114.7 ns/op · 0 alloc** |
+| 0 | 139.0 ns/op · 1 alloc | **125.6 ns/op · 0 alloc** |
+| 64 | 1,022 ns/op · 1 alloc | **123.0 ns/op · 0 alloc** |
+| 512 | 2,180 ns/op · 1 alloc | **122.5 ns/op · 0 alloc** |
 
 benchmark นี้ถูก**เพิ่มเข้า repo** ไม่ใช่รันทิ้ง — ตัวเลขที่อ้างในคอมเมนต์ต้องผลิตซ้ำได้ด้วย
 `make bench` ไม่งั้นมันคือความรู้สึกที่ใส่หน่วย ns/op
@@ -1756,7 +1756,7 @@ benchmark นี้ถูก**เพิ่มเข้า repo** ไม่ใช
 มีแต่การ**ย่น**เท่านั้นที่เลื่อน event ให้มาก่อน timer ที่ตั้งไว้แล้ว
 
 > **บทเรียนของ §8 ที่ย้อนกลับมาหาตัวเอง:** การแก้บั๊กที่ถูกต้องเชิงตรรกะ แต่ทำให้ path
-> ที่ร้อนที่สุดช้าลง 19 เท่า **ไม่มีเทสตัวไหนใน repo นี้จับได้** — coverage 100%,
+> ที่ร้อนที่สุดช้าลง ~18 เท่า **ไม่มีเทสตัวไหนใน repo นี้จับได้** — coverage 100%,
 > mutation 100%, `-race` 20 รอบ, fuzz: เขียวสนิททั้งก่อนและหลัง
 > ต้องเขียน benchmark ที่จำลองรูปแบบการใช้จริง (งานยาว heartbeat + waiter บล็อกจำนวนมาก)
 > ถึงจะเห็น
