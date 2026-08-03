@@ -1,0 +1,67 @@
+# mutant ที่ "รอด" เพราะ **แก้แล้วโปรแกรมเหมือนเดิม** ไม่ใช่เพราะเทสอ่อน
+# (equivalent mutant — ตัดสินด้วยเครื่องจักรไม่ได้ จึงต้องพิสูจน์ด้วยมือทีละตัว)
+#
+# กฎ: ห้ามใส่บรรทัดใหม่ที่นี่ ถ้ายังเขียนเหตุผลไม่ได้ว่า "ทำไมสังเกตไม่ได้"
+#     ไฟล์นี้คือช่องทางเดียวที่ทำให้ประตู mutation 100% ผ่าน — ใส่มั่ว = ปิดตาตัวเอง
+#
+# รูปแบบ: บรรทัดที่ขึ้นต้นด้วย # คือคอมเมนต์, ที่เหลือคือ key ทั้งบรรทัด
+#         key = ไฟล์:ฟังก์ชัน:การกลายพันธุ์#ลำดับซ้ำ (ไม่ผูกกับเลขบรรทัด)
+# ดู key ได้จาก output ของ `make mutate`
+
+# ── ตัวเปรียบเทียบที่ guard ทำให้ >= เท่ากับ > ────────────────────────
+# comparator ของ ready heap: `return a.Priority > b.Priority` อยู่ใต้
+# `if a.Priority != b.Priority` — เมื่อสองค่าไม่เท่ากันแน่นอน `>` กับ `>=` ให้ผลเดียวกัน
+queue.go:NewMemQueue:> → >=#0
+# `return a.seq < b.seq` — seq มาจากตัวนับที่เพิ่มทีละ 1 ใต้ล็อก ไม่มีวันซ้ำ → `<` = `<=`
+queue.go:NewMemQueue:< → <=#2
+# Stats หา "ค่ามากที่สุด" — ใช้ `>` หรือ `>=` ได้คำตอบเดียวกัน ต่างแค่ตัวไหนถูกเขียนทับ
+queue.go:MemQueue.Stats:> → >=#0
+
+# ── timer.Stop() ที่ไม่จำเป็นตั้งแต่ Go 1.23 ──────────────────────────
+# ตั้งแต่ Go 1.23 timer ที่ไม่ได้ Stop จะถูก GC เก็บได้ทันทีที่ไม่มีใครอ้างถึง
+# (เดิมต้อง Stop ไม่งั้นค้างจนถึงเวลา fire) → ลบทิ้งแล้วไม่มีพฤติกรรมใดเปลี่ยน
+# เก็บไว้เพราะเป็นการประกาศเจตนา และถูกต้องบน Go เวอร์ชันเก่าด้วย
+queue.go:MemQueue.Dequeue:ลบ timer.Stop()#0
+queue.go:MemQueue.Dequeue:ลบ timer.Stop()#1
+
+# ── broadcast ใน promoteLocked: ซ้ำซ้อนกับ timer ของ waiter เอง ────────
+# waiter ทุกตัวใน Dequeue ตั้ง timer ไว้ที่ min(delayed.head.RunAt,
+# leases.head.leaseUntil) ตาม nextEventLocked อยู่แล้ว และ promoteLocked จะย้ายงานได้
+# ก็ต่อเมื่อเวลานั้นมาถึง → waiter ตื่นเองพอดีโดยไม่ต้องพึ่ง broadcast
+#
+# ทางเดียวที่ waiter จะบล็อกโดย "ไม่มี timer" คือทั้ง delayed และ leases ว่าง
+# ซึ่งการจะมีของเข้าไปในสองกองนั้นต้องผ่าน Enqueue/Nack (broadcast เอง) หรือ
+# Dequeue ของ worker อื่น ซึ่งต้องมีงานใน ready ก่อน = ต้องมี broadcast มาก่อนแล้ว
+#
+# ⚠️ ความสมมูลนี้มีเงื่อนไข: **ทุกอย่างที่ขยับ timeline ให้เร็วขึ้นต้อง broadcast เอง**
+# เคยไม่จริงมาก่อน — Extend ที่ย่น lease เลื่อน leaseUntil ให้เร็วกว่า timer ที่ waiter
+# ตั้งไว้ โดยไม่ปลุกใคร ทำให้บรรทัดพวกนี้กลายเป็น "ตัวเดียวที่กู้สถานการณ์" (= ไม่สมมูล)
+# แก้ที่ต้นเหตุแล้ว (Extend broadcast) และ TestExtendShorteningWakesWaiter เฝ้าไว้
+# ถ้าเพิ่มเส้นทางที่ขยับเวลาโดยไม่ broadcast เมื่อไหร่ ต้องทบทวนรายการนี้ใหม่ทันที
+queue.go:MemQueue.promoteLocked:ลบ moved = true#0
+queue.go:MemQueue.promoteLocked:true → false#0
+queue.go:MemQueue.promoteLocked:ลบ moved = true#1
+queue.go:MemQueue.promoteLocked:true → false#1
+queue.go:MemQueue.promoteLocked:ลบ q.broadcastLocked()#0
+
+# ── sentinel ที่ถูกเขียนซ้ำสองที่ ──────────────────────────────────────
+# ทุกเส้นทางที่เข้า retryLocked ผ่าน heap.Pop/heap.Remove มาก่อนเสมอ ซึ่ง Pop
+# ตั้ง index = -1 ให้แล้ว → ลบบรรทัดใน retryLocked จึงไม่มีผลที่ MemQueue มองเห็น
+#
+# ฝั่ง Pop เองไม่ได้อยู่ในรายการนี้: TestHeapPopClearsIndex เทสสัญญาของ jobHeap
+# ตรง ๆ โดยไม่ผ่าน MemQueue จึงฆ่า mutant ฝั่งนั้นได้
+# (บทเรียน: เมื่อสอง statement ครอบกันเอง ให้เทสที่ระดับล่างสุดที่แยกมันออกจากกันได้)
+queue.go:MemQueue.retryLocked:ลบ j.index = -1#0
+
+# ── ค่าที่ผลลัพธ์ถูกกลืนไปแล้ว ────────────────────────────────────────
+# `return 0, false` — ผู้เรียกดู bool ก่อนเสมอ ค่าแรกจึงไม่ถูกใช้เมื่อ false
+queue.go:MemQueue.nextEventLocked:0 → 1#0
+# max(d, 0) → max(d, 1): ต่างกัน 1 นาโนวินาที บน timer ที่ resolution หยาบกว่านั้นมาก
+queue.go:MemQueue.nextEventLocked:0 → 1#1
+# min(attempt, 20) → 21: 100ms<<20 ≈ 29 ชั่วโมง ซึ่งเกินเพดาน 30s ไปแล้ว ทั้งสองค่า
+# จึงถูก min ด้วย ceiling เป็น 30s เท่ากัน (และกัน shift overflow ได้เหมือนกัน)
+queue.go:Backoff:20 → 21#0
+# rand.Int64N(d+1) → (d-1) / (d+0): ช่วงสุ่มเปลี่ยนไป 1–2 นาโนวินาที บนค่าที่เล็กที่สุด
+# คือ 100ms — วัดทางสถิติไม่ได้ และไม่กระทบคุณสมบัติ full jitter
+queue.go:Backoff:+ → -#0
+queue.go:Backoff:1 → 0#0

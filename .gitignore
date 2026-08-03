@@ -1,0 +1,5 @@
+# ผลลัพธ์ของประตูคุณภาพ — สร้างใหม่ได้ด้วย make cover
+coverage.out
+
+# corpus ที่ fuzzer สร้างเองระหว่างรัน (ตัวที่ทำให้พังอยู่ใน testdata/fuzz/ ซึ่ง commit ไว้)
+/fuzz-*

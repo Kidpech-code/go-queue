@@ -1,0 +1,74 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+# ทุก job คือ "ประตู" — แดงแล้วห้าม merge ไม่ใช่ "รายงานไว้ดูเฉย ๆ"
+# แยกเป็นหลาย job เพื่อให้เห็นทันทีว่าพังเพราะอะไร โดยไม่ต้องเปิด log
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod, cache: true }
+      - run: make lint
+
+  # -race ไม่ใช่ทางเลือกสำหรับโค้ดคิว: บั๊กที่เหลือทั้งหมดเป็นบั๊กเรื่องลำดับ
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod, cache: true }
+      - run: make race
+
+  cover:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod, cache: true }
+      - run: make cover
+      # อัปโหลดโปรไฟล์เดียวกับที่ประตูใช้ — ตัวเลขบน Codecov กับใน CI จึงตรงกันเสมอ
+      - uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.out
+          fail_ci_if_error: true
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: coverage, path: coverage.out }
+
+  # ประตูที่สำคัญที่สุด: coverage 100% พิสูจน์แค่ว่า "รันผ่าน"
+  # mutation พิสูจน์ว่า "ถ้าผิดแล้วจะรู้" — ตัวที่ปล่อยผ่านต้องมีเหตุผลใน mutation-allow.txt
+  mutation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod, cache: true }
+      - run: make mutate
+
+  # เทสที่ผ่านบ้างไม่ผ่านบ้างแย่กว่าไม่มีเทส — รันซ้ำจนมั่นใจ
+  flaky:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod, cache: true }
+      - run: make flaky
+
+  # fuzz: บน PR รันสั้น ๆ พอกันของเสียหลุด; ของยาวปล่อยเป็น nightly
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod, cache: true }
+      - run: make fuzz FUZZTIME=${{ github.event_name == 'pull_request' && '60s' || '30s' }}
+      - uses: actions/upload-artifact@v4
+        if: failure() # input ที่ทำให้พังคือของมีค่า — ต้องเก็บไว้ทำเป็น seed corpus
+        with: { name: fuzz-crashers, path: testdata/fuzz/ }

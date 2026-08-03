@@ -1,0 +1,25 @@
+# Codecov: ประตู ไม่ใช่ป้ายประดับ
+#
+# ไม่มี `ignore:` โดยตั้งใจ — ทั้ง repo รวม tools/ อยู่ใต้ไม้บรรทัดเดียวกัน
+# เครื่องมือที่รับรองคุณภาพของโค้ดอื่นแล้วยกเว้นตัวเอง คือจุดบอดที่ใหญ่ที่สุด
+coverage:
+  precision: 1
+  round: down
+  range: "100...100" # ไม่มีโซนสีเหลือง: 100 คือผ่าน ต่ำกว่านั้นคือไม่ผ่าน
+  status:
+    project:
+      default:
+        target: 100%
+        threshold: 0% # ตกแม้แต่บรรทัดเดียวก็แดง
+        if_ci_failed: error
+    patch:
+      default:
+        target: 100%
+        threshold: 0% # โค้ดใหม่ทุกบรรทัดต้องมีเทส ไม่มีข้อยกเว้นให้ "ไว้ทีหลัง"
+
+comment:
+  layout: "condensed_header, diff, flags, components"
+  require_changes: true
+
+github_checks:
+  annotations: true
