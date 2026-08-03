@@ -261,7 +261,10 @@ func TestModelRandomOps(t *testing.T) {
 //	go test -run=Fuzz -fuzz=FuzzQueueOps -fuzztime=60s
 //
 // ใช้เวลาจริง (ไม่ใช่ synctest) เพราะ fuzz ต้องรันซ้ำเร็ว ๆ หลายแสนรอบ
-// และ assert ทั้งหมดในนี้เป็นเชิงโครงสร้าง ไม่ขึ้นกับเวลา → ไม่ flaky
+// assert ทั้งหมดเป็นเชิงโครงสร้างจึงไม่ขึ้นกับเวลา แต่ **ความยาว** ของแต่ละ exec ขึ้น:
+// input ที่อัด op นอนจนรวมได้หลายร้อย ms บวก CI ที่โหลดสูง ทำให้ engine ของ go
+// ยิง "context deadline exceeded" ตอน fuzztime หมดพอดี (เจอจริง: CI แดงทั้งที่ไม่มี crasher)
+// → จำกัดงบนอนรวมต่อหนึ่ง input ให้ exec จบเร็วเสมอ
 func FuzzQueueOps(f *testing.F) {
 	f.Add([]byte{0, 1, 1, 0, 2, 0})                    // enqueue → dequeue → ack
 	f.Add([]byte{0, 0, 1, 0, 3, 0, 5, 30, 1, 0, 2, 0}) // nack → รอ → dequeue ซ้ำ
@@ -272,7 +275,12 @@ func FuzzQueueOps(f *testing.F) {
 			ops = ops[:400]
 		}
 		q := NewMemQueue(8, 3, 2*time.Millisecond)
-		driveOps(t, q, ops, func(d time.Duration) { time.Sleep(d / 20) })
+		budget := 50 * time.Millisecond // เกิน visibility (2ms) หลายเท่า — เส้นทาง lease หมดยังถูกยิงครบ
+		driveOps(t, q, ops, func(d time.Duration) {
+			d = min(d/20, budget)
+			budget -= d
+			time.Sleep(d)
+		})
 	})
 }
 
