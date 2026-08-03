@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -46,6 +47,7 @@ func fixture(t *testing.T, name string) string {
 // fixture "strong" มีเทสแน่น → mutant ต้องตายหมด และต้องมี invalid อย่างน้อยหนึ่งตัว
 // (mutant `+` → `-` บน string คอมไพล์ไม่ผ่าน — ห้ามนับเป็น killed ไม่งั้น score พองขึ้นฟรี ๆ)
 func TestCLIStrongFixtureScores100(t *testing.T) {
+	t.Parallel() // fixture แยกของใครของมัน — รันทับกันได้
 	var out bytes.Buffer
 	// timeout สั้น: fixture มี mutant ที่ลบ n-- ทิ้งแล้ววนไม่จบ — ต้องถูกนับเป็น killed
 	code := cli([]string{"-pkg", fixture(t, "strong"), "-timeout", "20s", "-allow", "/dev/null"}, &out)
@@ -68,6 +70,7 @@ func TestCLIStrongFixtureScores100(t *testing.T) {
 // fixture "weak" มีเทสที่ให้ coverage 100% แต่ไม่ assert อะไร → mutant ต้องรอด
 // นี่คือเหตุผลทั้งหมดที่เครื่องมือนี้มีอยู่ ถ้าเทสนี้ผ่านตอน score = 100% แปลว่าพัง
 func TestCLIWeakFixtureReportsSurvivors(t *testing.T) {
+	t.Parallel() // fixture แยกของใครของมัน — รันทับกันได้
 	var out bytes.Buffer
 	code := cli([]string{"-pkg", fixture(t, "weak"), "-timeout", "20s", "-allow", "/dev/null"}, &out)
 	s := out.String()
@@ -84,6 +87,7 @@ func TestCLIWeakFixtureReportsSurvivors(t *testing.T) {
 
 // allowlist ต้องยกเว้น mutant ที่ระบุไว้ ทำให้ผ่านเกณฑ์ได้
 func TestCLIAllowlistLetsSurvivorsPass(t *testing.T) {
+	t.Parallel() // fixture แยกของใครของมัน — รันทับกันได้
 	pkg := fixture(t, "weak")
 	var list bytes.Buffer
 	if code := cli([]string{"-pkg", pkg, "-list"}, &list); code != 0 {
@@ -114,6 +118,7 @@ func TestCLIAllowlistLetsSurvivorsPass(t *testing.T) {
 
 // baseline แดง = ตัวเลขทุกตัวหลังจากนั้นไร้ความหมาย ต้องหยุดทันที
 func TestCLIRejectsRedBaseline(t *testing.T) {
+	t.Parallel() // fixture แยกของใครของมัน — รันทับกันได้
 	var out bytes.Buffer
 	code := cli([]string{"-pkg", fixture(t, "broken"), "-timeout", "20s", "-allow", "/dev/null"}, &out)
 	if code != 1 || !strings.Contains(out.String(), "baseline เทสไม่ผ่าน") {
@@ -122,6 +127,7 @@ func TestCLIRejectsRedBaseline(t *testing.T) {
 }
 
 func TestCLIListDoesNotRunTests(t *testing.T) {
+	t.Parallel() // fixture แยกของใครของมัน — รันทับกันได้
 	var out bytes.Buffer
 	// baseline แดง แต่ -list ไม่รันเทส จึงต้องสำเร็จ
 	if code := cli([]string{"-pkg", fixture(t, "broken"), "-list"}, &out); code != 0 {
@@ -155,6 +161,7 @@ func TestCLIErrors(t *testing.T) {
 }
 
 func TestCLIRejectsUnparsableSource(t *testing.T) {
+	t.Parallel() // fixture แยกของใครของมัน — รันทับกันได้
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "bad.go"), []byte("package x\nfunc ("), 0o644); err != nil {
 		t.Fatal(err)
@@ -176,8 +183,17 @@ func TestCLIReportsSandboxFailure(t *testing.T) {
 
 // main() ต้องส่ง exit code ของ cli ออกไปตรง ๆ
 func TestMainPropagatesExitCode(t *testing.T) {
-	oldExit, oldArgs := osExit, os.Args
-	t.Cleanup(func() { osExit, os.Args = oldExit, oldArgs })
+	oldExit, oldArgs, oldStdout := osExit, os.Args, os.Stdout
+	t.Cleanup(func() { osExit, os.Args, os.Stdout = oldExit, oldArgs, oldStdout })
+
+	// main() เขียนลง os.Stdout จริง — ถ้าไม่เบี่ยงทิ้ง ข้อความ "ไม่พบไฟล์ .go"
+	// จะโผล่ใน log ของเทสที่**ผ่าน** แล้วดูเหมือนมีอะไรพัง (มีคนตกใจมาแล้ว)
+	devnull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer devnull.Close()
+	os.Stdout = devnull
 
 	got := -1
 	osExit = func(code int) { got = code }
@@ -191,6 +207,7 @@ func TestMainPropagatesExitCode(t *testing.T) {
 // ── หน่วยย่อย: จุดที่ตัดสินผิดแล้วตัวเลขพองขึ้นเงียบ ๆ ──────────────────
 
 func TestSandboxTestClassifiesOutcomes(t *testing.T) {
+	t.Parallel() // fixture แยกของใครของมัน — รันทับกันได้
 	pkg := fixture(t, "strong")
 	sb, err := newSandbox(pkg)
 	if err != nil {
@@ -250,6 +267,7 @@ func TestSandboxTestWhenGoMissing(t *testing.T) {
 }
 
 func TestSandboxErrors(t *testing.T) {
+	t.Parallel() // fixture แยกของใครของมัน — รันทับกันได้
 	if _, err := newSandbox(filepath.Join(t.TempDir(), "ไม่มีจริง")); err == nil {
 		t.Error("ไดเรกทอรีไม่มีจริงต้อง error")
 	}
@@ -267,6 +285,7 @@ func TestSandboxErrors(t *testing.T) {
 }
 
 func TestSandboxMutateErrors(t *testing.T) {
+	t.Parallel() // fixture แยกของใครของมัน — รันทับกันได้
 	pkg := fixture(t, "strong")
 	sb, err := newSandbox(pkg)
 	if err != nil {
@@ -290,6 +309,7 @@ func TestSandboxMutateErrors(t *testing.T) {
 
 // สร้าง sandbox ไม่สำเร็จ ต้องคืนตัวที่สร้างไปแล้วมาให้ปิดด้วย ไม่ใช่ปล่อยรั่ว
 func TestNewSandboxesReturnsPartialOnFailure(t *testing.T) {
+	t.Parallel() // fixture แยกของใครของมัน — รันทับกันได้
 	boxes, err := newSandboxes(filepath.Join(t.TempDir(), "ไม่มีจริง"), 3)
 	if err == nil {
 		t.Fatal("ไดเรกทอรีไม่มีจริงต้อง error")
@@ -314,6 +334,7 @@ func TestNewSandboxesReturnsPartialOnFailure(t *testing.T) {
 
 // -jobs 0 เคยทำให้ค้างตลอดกาล: ไม่มี worker แต่ยังป้อนงานเข้า channel
 func TestCLIClampsJobs(t *testing.T) {
+	t.Parallel() // fixture แยกของใครของมัน — รันทับกันได้
 	var out bytes.Buffer
 	code := cli([]string{"-pkg", fixture(t, "strong"), "-jobs", "0", "-timeout", "20s", "-allow", "/dev/null"}, &out)
 	if code != 0 {
@@ -547,5 +568,55 @@ func TestGoFilesSkipsTestFilesAndBadPatterns(t *testing.T) {
 	// ชื่อไดเรกทอรีที่มี [ ค้าง ทำให้ glob pattern เสีย — ต้องคืน error ไม่ใช่เงียบ
 	if _, err := goFiles("ก[ข"); err == nil {
 		t.Error("pattern เสียต้อง error")
+	}
+}
+
+// SIGINT/SIGTERM กลางรันต้องเก็บ sandbox แล้วออกด้วย 130 — ไม่ใช่ทิ้งขยะไว้ใน /tmp
+// (บั๊กจริงที่วัดได้: ก่อนแก้ kill กลางรันทิ้ง jobs × ~130KB ทุกครั้ง)
+// ห้าม Parallel: สลับ osExit และส่งสัญญาณถึงทั้งโปรเซส
+func TestSignalCleansSandboxes(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp+"/") // ให้ sandbox ของเทสนี้อยู่ในคอกของตัวเอง นับง่าย
+
+	oldExit := osExit
+	t.Cleanup(func() { osExit = oldExit })
+	exited := make(chan int, 1)
+	osExit = func(code int) { exited <- code }
+
+	done := make(chan int, 1)
+	go func() {
+		var out bytes.Buffer
+		// fixture จริง + timeout ยาว: รันนานพอให้สัญญาณมาถึงระหว่างทาง
+		done <- cli([]string{"-pkg", fixture(t, "strong"), "-timeout", "60s", "-allow", "/dev/null"}, &out)
+	}()
+
+	// รอให้ sandbox เกิดจริงก่อนค่อยยิงสัญญาณ
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if m, _ := filepath.Glob(filepath.Join(tmp, "mutate-*")); len(m) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("sandbox ไม่ถูกสร้างภายใน 30 วิ")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := syscall.Kill(syscall.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case code := <-exited:
+		if code != 130 {
+			t.Errorf("exit code = %d, ต้องการ 130 (128+SIGINT ตามธรรมเนียม)", code)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("ไม่มีการ exit หลังส่งสัญญาณ")
+	}
+	// osExit ปลอมไม่ฆ่าโปรเซสจริง → cli วิ่งต่อจนจบเอง (เฉพาะในเทสนี้)
+	<-done
+
+	if left, _ := filepath.Glob(filepath.Join(tmp, "mutate-*")); len(left) != 0 {
+		t.Errorf("sandbox ค้าง %d ตัวหลังโดนสัญญาณ: %v", len(left), left)
 	}
 }

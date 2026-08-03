@@ -27,12 +27,14 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -53,8 +55,11 @@ func cli(args []string, out io.Writer) int {
 		threshold = fs.Float64("threshold", 100, "mutation score ต่ำสุดที่ยอมรับ (%)")
 		timeout   = fs.Duration("timeout", 60*time.Second, "เวลาสูงสุดต่อ mutant (mutant ที่ทำให้ค้าง = killed)")
 		allowFile = fs.String("allow", "mutation-allow.txt", "รายการ mutant ที่พิสูจน์แล้วว่า equivalent")
-		jobs      = fs.Int("jobs", max(runtime.NumCPU()-2, 1), "จำนวน mutant ที่รันพร้อมกัน")
-		list      = fs.Bool("list", false, "แสดงรายการ mutant แล้วออก ไม่รันเทส")
+		// ค่าเริ่มต้น = NumCPU เต็ม: ตัวเครื่องมือเองแทบไม่กิน CPU (นั่งรอ subprocess)
+		// งานจริงอยู่ใน `go test` ลูก — เดิมใช้ NumCPU-2 ทำให้ runner 4 คอร์ของ CI
+		// เหลือ worker แค่ 2 ตัว = จ่ายเวลาเป็นสองเท่าเพื่อถนอมคอร์ที่ไม่มีใครใช้
+		jobs = fs.Int("jobs", max(runtime.NumCPU(), 1), "จำนวน mutant ที่รันพร้อมกัน")
+		list = fs.Bool("list", false, "แสดงรายการ mutant แล้วออก ไม่รันเทส")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -87,6 +92,21 @@ func cli(args []string, out io.Writer) int {
 	if err != nil {
 		return fail(out, err)
 	}
+
+	// Ctrl-C กลางรัน: defer ไม่ทำงานเมื่อโปรเซสถูกฆ่า → sandbox ค้างเป็นขยะ
+	// (วัดได้จริง: kill กลางรันทิ้งไว้ jobs × ~130KB ทุกครั้ง) เก็บกวาดเองแล้ว
+	// ออกด้วย 130 ตามธรรมเนียม 128+SIGINT
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	// Stop ไม่ได้ปิด channel — ต้องปิดเองไม่งั้น goroutine เฝ้าสัญญาณค้างหนึ่งตัว
+	// ต่อการเรียก cli() หนึ่งครั้ง (เทสเรียกเป็นสิบครั้ง = สิบ goroutine ค้าง)
+	defer func() { signal.Stop(sig); close(sig) }()
+	go func() {
+		if _, ok := <-sig; ok { // ok=false = จบปกติผ่าน defer ข้างบน ไม่ต้องทำอะไร
+			closeAll(boxes)
+			osExit(130)
+		}
+	}()
 
 	// baseline ต้องเขียวก่อน ไม่งั้น "survived" ทุกตัวคือขยะ
 	if rc, baseOut := boxes[0].test(*timeout); rc != 0 {
@@ -392,8 +412,12 @@ func (s *sandbox) mutate(m mutant) error {
 
 // test คืน exit code: 0 = ผ่าน, 2 = คอมไพล์ไม่ผ่าน, อื่น ๆ = เทสแดง
 // mutant ที่ทำให้ค้าง (เช่น ลบ n-- ทิ้งจนวนไม่จบ) นับเป็น killed — เทสจับได้ด้วยการ timeout
+//
+// -failfast: mutant ถูก "ฆ่า" เมื่อมีเทสแดง ≥ 1 ตัว — เทสที่เหลือไม่เปลี่ยนคำตัดสิน
+// จึงหยุดได้ทันทีที่เจอตัวแรก (86% ของ mutant ตาย → ประหยัดเกือบทั้งชุดต่อ mutant)
+// survivor ไม่มีเทสแดงให้หยุด = รันเต็มชุดเหมือนเดิมเป๊ะ ⇒ คำตัดสินเหมือนเดิมทุกตัว
 func (s *sandbox) test(timeout time.Duration) (int, string) {
-	cmd := exec.Command("go", "test", "-count=1", "-timeout", timeout.String(), ".")
+	cmd := exec.Command("go", "test", "-count=1", "-failfast", "-timeout", timeout.String(), ".")
 	cmd.Dir = s.dir
 	cmd.Env = append(os.Environ(), "GOFLAGS=") // กัน -race หลุดมาจาก env — mutation ต้องเร็ว
 	out, err := cmd.CombinedOutput()
